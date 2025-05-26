@@ -28,7 +28,7 @@ def get_citation_input():
 
 def lookup_citation(volume, reporter, page):
     api_url = "https://www.courtlistener.com/api/rest/v4/citation-lookup/"
-    token = "b6bc45c46b6507dcde53992ef3523e46e5a9e3ed"
+    token = COURTLISTENER_API_TOKEN
     
     headers = {
         "Authorization": f"Token {token}",
