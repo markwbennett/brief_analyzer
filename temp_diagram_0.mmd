@@ -1,0 +1,99 @@
+graph TD
+    %% Input Sources
+    PDF[PDF Brief]
+    TXT[Text Document]
+    DOCX[DOCX Document]
+    CSV[CSV with Citations]
+    
+    %% Extraction Tools
+    ET[extract_text.py]
+    EA[extract_authorities.py]
+    EE[eyecite_extractor.py]
+    EM[extract_minimal.py]
+    
+    %% API and Lookup Tools
+    CL[courtlistener_api.py]
+    CLT[citation_lookup_test.py]
+    CL_SIMPLE[citation_lookup.py]
+    CI[citation_info.py]
+    CE[citations_enricher.py]
+    FO[fetch_opinion.py]
+    GOT[get_opinion_text.py]
+    
+    %% Processing and Formatting
+    FORMAT[format_opinion.py]
+    GR[generate_report.py]
+    
+    %% Storage
+    DB[(citations.db)]
+    CDB[citations_db.py]
+    
+    %% Utilities
+    LA[legal_abbreviations.py]
+    
+    %% Flow
+    PDF --> ET
+    PDF --> EA
+    TXT --> EE
+    DOCX --> EE
+    
+    ET --> |extracted text| EA
+    EA --> |cleaned text| DB
+    EA --> |finds citations| DB
+    
+    EE --> |citation data| DB
+    EM --> |minimal citation data| DB
+    
+    CL_SIMPLE --> |uses| CL
+    CLT --> |uses| CL
+    CI --> |uses| CL
+    GOT --> |uses| CL
+    FO --> |uses| CL
+    CE --> |uses| CL
+    
+    CSV --> CE
+    CE --> |enriched data| CSV
+    
+    DB <--> CDB
+    CDB --> GR
+    GR --> |reports| TXT
+    
+    CL --> |opinion data| FORMAT
+    FORMAT --> |formatted opinions| TXT
+    
+    EE --> |uses| LA
+    
+    %% Subgraphs for organization
+    subgraph Extraction
+        ET
+        EA
+        EE
+        EM
+    end
+    
+    subgraph "API Clients"
+        CL
+        CL_SIMPLE
+        CLT
+        CI
+        GOT
+        FO
+    end
+    
+    subgraph "Enrichment"
+        CE
+    end
+    
+    subgraph "Formatting"
+        FORMAT
+        GR
+    end
+    
+    subgraph "Storage"
+        DB
+        CDB
+    end
+    
+    subgraph "Utilities"
+        LA
+    end
