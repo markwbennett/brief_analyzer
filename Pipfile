@@ -7,6 +7,7 @@ name = "pypi"
 eyecite = "*"
 reporters-db = "*"
 "pdfminer.six" = "*"
+requests = "*"
 
 [dev-packages]
 
