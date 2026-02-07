@@ -1,0 +1,38 @@
+# Appellate Brief Analyzer -- Configuration Template
+# Copy this file to your project directory and customize.
+
+# Project directory (can also be set via CLI)
+# project_dir: /path/to/project
+
+# Case number for txcourts.gov fetch (optional if PDFs already present)
+# case_number: 01-24-00686-CR
+
+# Court of appeals code (default: inferred from case number prefix)
+# coa01-coa14 for courts of appeals, coacca for CCA, coascotx for SCOTX
+# coa: coa01
+
+# CourtListener API (free -- tries before Westlaw)
+courtlistener:
+  # api_token: your_token_here
+  # Or set COURTLISTENER_TOKEN environment variable
+
+# Westlaw credentials (optional -- can log in manually)
+westlaw:
+  # username: your@email.com
+  # password: yourpassword
+  # client_matter: your-client-matter
+  login_url: https://next.westlaw.com
+
+# PDF generation settings
+pandoc:
+  font: Equity
+  font_size: 14
+  heading_font: Concourse 6
+  margins: 1.5in
+  document_class: extarticle
+
+# Claude model (opus, sonnet, haiku)
+claude_model: opus
+
+# Number of parallel Claude agents for cite-check
+parallel_agents: 4

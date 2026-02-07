@@ -1,297 +1,195 @@
-# Legal Citation Extractor
+# Brief Analyzer
 
-A Python script for extracting legal citations from documents using the [eyecite](https://github.com/freelawproject/eyecite) library.
+Automated pipeline for analyzing Texas appellate briefs. Downloads filings from txcourts.gov, extracts cited authorities, downloads case opinions from CourtListener and Westlaw, cite-checks every citation, generates issue analysis and moot court Q&A, and produces PDF reports.
 
-## Features
+## Pipeline Steps
 
-- Extracts case citations (e.g., Brown v. Board of Education, 347 U.S. 483 (1954))
-- Extracts statutory citations (e.g., 42 U.S.C. § 1983)
-- Extracts constitutional citations
-- Provides detailed information about each citation including:
-  - Case names (plaintiff and defendant)
-  - Reporter information
-  - Year
-  - Court
-  - Volume and page numbers
-- Outputs citations in structured JSON format
+| # | Step | Description |
+|---|------|-------------|
+| 1 | `fetch` | Download filings from txcourts.gov |
+| 2 | `convert` | Convert PDFs to text (`pdftotext`) |
+| 3 | `authorities` | Extract authorities list (Claude) |
+| 4 | `courtlistener` | Download cases from CourtListener API (free) |
+| 5 | `westlaw` | Download remaining cases from Westlaw (semi-automated) |
+| 6 | `process` | Convert RTFs to text, rename with full citations |
+| 7 | `verify` | Verify all authorities are downloaded |
+| 8 | `citecheck` | Parallel cite-check of all briefs (Claude) |
+| 9 | `analysis` | Generate issue analysis (Claude) |
+| 10 | `mootqa` | Generate moot court Q&A (Claude) |
+| 11 | `pdf` | Generate PDF outputs (pandoc) |
+
+Steps 4 and 5 work together: CourtListener is tried first (free, no login), and the Westlaw step automatically skips any citations already downloaded. If CourtListener covers everything, Westlaw is skipped entirely.
 
 ## Requirements
 
-- Python 3.6+
-- eyecite library
+- Python 3.12+
+- [pdftotext](https://poppler.freedesktop.org/) (from poppler) -- for PDF conversion
+- [pandoc](https://pandoc.org/) + LaTeX -- for PDF generation
+- [Claude Code](https://claude.ai/claude-code) -- for AI-powered steps (authorities, citecheck, analysis, mootqa)
+- [Playwright](https://playwright.dev/python/) -- for Westlaw automation (only if needed)
 
 ## Installation
 
 ```bash
-# With pipenv (recommended)
-pipenv install eyecite
+git clone git@github.com:markwbennett/brief_analyzer.git
+cd brief-analyzer
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 
-# Or with pip
-pip install eyecite
+# Install Playwright browser (only needed for Westlaw step)
+python -m playwright install chromium
+```
+
+## Configuration
+
+### CourtListener API Token
+
+Get a free token at https://www.courtlistener.com/sign-in/ and set it as an environment variable:
+
+```bash
+export COURTLISTENER_TOKEN=your_token_here
+```
+
+Or add it to `brief_config.yaml`:
+
+```yaml
+courtlistener:
+  api_token: your_token_here
+```
+
+### Config File
+
+Copy `brief_config.yaml` to your project directory and customize:
+
+```yaml
+courtlistener:
+  # api_token: your_token_here  # or use COURTLISTENER_TOKEN env var
+
+westlaw:
+  login_url: https://next.westlaw.com
+
+pandoc:
+  font: Equity B
+  font_size: 14
+  heading_font: Concourse 6
+  margins: 1.5in
+
+claude_model: opus
+parallel_agents: 4
 ```
 
 ## Usage
 
-```bash
-# Basic usage
-pipenv run python eyecite_extractor.py document.txt
-
-# Process multiple files
-pipenv run python eyecite_extractor.py document1.txt document2.txt document3.txt
-
-# Output in JSON format
-pipenv run python eyecite_extractor.py document.txt --json
-
-# Save results to a file
-pipenv run python eyecite_extractor.py document.txt --output results.json
-
-# Show debug information
-pipenv run python eyecite_extractor.py document.txt --debug
-```
-
-## Citation Types Detected
-
-The script can detect and extract various citation types, including:
-
-- **FullCaseCitation**: Complete case citations with volume, reporter, and page number
-- **FullLawCitation**: Statutory citations
-- **ConstitutionalCitation**: Citations to constitutional provisions
-
-## Output Format
-
-When using the `--json` flag, the script outputs an array of citation objects with the following structure:
-
-```json
-{
-  "type": "FullCaseCitation|FullLawCitation|...",
-  "text": "Full citation text",
-  "context": "Surrounding text",
-  "year": "1954",
-  "plaintiff": "Brown",
-  "defendant": "Board of Education",
-  "volume": "347",
-  "reporter": "U.S.",
-  "page": "483",
-  "court": "scotus",
-  "groups": {},
-  "file": "Source file"
-}
-```
-
-## Credits
-
-This tool uses the [eyecite](https://github.com/freelawproject/eyecite) library developed by the Free Law Project.
-
-## CourtListener API Client
-
-This repository includes a simple command line client for the CourtListener API. The client allows you to search for opinions, look up cases by citation, and retrieve information about dockets.
-
-### Setup
-
-Before using the API client, you need to:
-
-1. Register for an account at [CourtListener](https://www.courtlistener.com/)
-2. Get an API token from your profile page at [https://www.courtlistener.com/profile/api/](https://www.courtlistener.com/profile/api/)
-3. Set your API token as an environment variable:
+### Full Pipeline
 
 ```bash
-export COURT_LISTENER_TOKEN="your_api_token_here"
+# Fetch filings and run everything
+python -m brief_analyzer /path/to/project --case 01-24-00686-CR
+
+# Run on a directory that already has PDFs
+python -m brief_analyzer /path/to/project
 ```
 
-Alternatively, you can create a `.env` file in the project root with:
-
-```
-COURT_LISTENER_TOKEN=your_api_token_here
-```
-
-### Usage
+### Single Step
 
 ```bash
-# Get help and see all options
-./courtlistener_api.py -h
-
-# List available API endpoints
-./courtlistener_api.py endpoints
-
-# Search for opinions
-./courtlistener_api.py search "fourth amendment"
-
-# Search with pagination 
-./courtlistener_api.py search "fourth amendment" --page 2
-
-# Get all search results (limited to 10 pages by default)
-./courtlistener_api.py search "fourth amendment" --all
-
-# Get all search results with a custom page limit
-./courtlistener_api.py search "fourth amendment" --all --max-pages 5
-
-# Save search results to a file
-./courtlistener_api.py search "fourth amendment" --output results.json
-
-# Look up a case by citation
-./courtlistener_api.py citation "410 U.S. 113"
-
-# Get details for a specific opinion and save to file
-./courtlistener_api.py opinion 12345 --output opinion.json
-
-# Get details for a specific docket
-./courtlistener_api.py docket 67890
-
-# Get the full text of an opinion by citation
-./courtlistener_api.py text "410 U.S. 113" --metadata
-
-# Save the opinion text to a file
-./courtlistener_api.py text "410 U.S. 113" --output roe_v_wade.txt
-
-# Use direct citation format (more reliable for some citations)
-./courtlistener_api.py direct "U.S." "410" "113"
-
-# Save direct citation lookup results to a file
-./courtlistener_api.py direct "U.S." "347" "483" --output brown_v_board.json
+python -m brief_analyzer /path/to/project --step courtlistener
+python -m brief_analyzer /path/to/project --step citecheck
 ```
 
-### API Documentation
-
-For full API documentation, see the [CourtListener API documentation](https://www.courtlistener.com/help/api/).
-
-### Working with State Court Citations
-
-The CourtListener API may return a "400 Bad Request" error for some state court citations. This often happens because state reporter citations need to specify the state. The `--try-alternatives` flag helps with this by:
-
-1. Trying various format variations (with/without periods, different spacing)
-2. Automatically adding appropriate state abbreviations for common reporters:
-   - For S.W./S.W.2d/S.W.3d: Tex., Ky., Mo., Tenn., Ark.
-   - For P./P.2d/P.3d: Cal., Colo., Kan., Or., Wash.
-   - For N.E.: Ill., Ind., Mass., N.Y., Ohio
-   - For N.W.: Iowa, Mich., Minn., Neb., Wis.
-   - And more...
-
-Examples of properly formatted state citations:
-- `698 S.W.2d 362 (Tex.)` instead of just `698 S.W.2d 362`
-- `543 N.E.2d 49 (Ill.)` instead of just `543 N.E.2d 49`
-
-### Direct Citation Format
-
-For more reliable citation lookup, especially for federal cases, you can use the direct citation format:
+### Resume from Last Failure
 
 ```bash
-./courtlistener_api.py direct REPORTER VOLUME PAGE
+python -m brief_analyzer /path/to/project --resume
 ```
 
-This uses CourtListener's URL citation format (e.g., `/c/U.S./410/113/` for Roe v. Wade). This format is:
-- More reliable for federal cases
-- Doesn't require authentication 
-- Works with standard reporter abbreviations
-- Bypasses the API's citation validation
-
-#### Common Reporter Abbreviations:
-- `U.S.` - United States Reports (Supreme Court)
-- `F.` - Federal Reporter
-- `F.2d` - Federal Reporter, Second Series
-- `F.3d` - Federal Reporter, Third Series
-- `S.Ct.` - Supreme Court Reporter
-- `L.Ed.` - Lawyers' Edition Supreme Court Reports
-- `L.Ed.2d` - Lawyers' Edition Supreme Court Reports, Second Series
-
-The `--debug` flag will show which citation formats are being tried.
-
-## Test Scripts
-
-The repository includes two test scripts for interacting with the CourtListener API:
-
-### Interactive Test Script
-
-The `citation_lookup_test.py` script is an interactive tool that prompts for a citation and retrieves all available information:
+### Check Status
 
 ```bash
-# Run the interactive test script
-./citation_lookup_test.py
+python -m brief_analyzer /path/to/project --status
 ```
 
-The script will:
-1. Ask if you want to enter an API token (if not set in the environment)
-2. Prompt for a citation to look up
-3. Retrieve all available information from CourtListener
-4. Save the results to a text file with a timestamp
+### CLI Options
 
-### Command-Line Test Script
+```
+positional arguments:
+  project_dir          Path to the project directory
 
-The `citation_info.py` script is a non-interactive command-line tool with more options:
-
-```bash
-# Basic usage
-./citation_info.py "410 U.S. 113"
-
-# Include opinion text
-./citation_info.py "410 U.S. 113" --include-text
-
-# Save to a specific file
-./citation_info.py "410 U.S. 113" --output roe_v_wade.txt
-
-# Use a specific API token
-./citation_info.py "410 U.S. 113" --token YOUR_API_TOKEN
-
-# Output in JSON format
-./citation_info.py "410 U.S. 113" --format json
-
-# Try alternative citation formats if lookup fails
-./citation_info.py "698 S.W.2d 362" --try-alternatives
-
-# Show debug information
-./citation_info.py "698 S.W.2d 362" --debug --try-alternatives
+options:
+  --case CASE_NUMBER   Case number (e.g., 01-24-00686-CR)
+  --coa COA            Court of appeals code (e.g., coa01)
+  --step STEP          Run a single pipeline step
+  --resume             Resume from the first incomplete step
+  --parallel N         Number of parallel Claude agents (default: 4)
+  --model MODEL        Claude model (default: opus)
+  --config PATH        Path to brief_config.yaml
+  --status             Show pipeline status and exit
 ```
 
-Both scripts provide detailed error messages if the lookup fails, including instructions on how to get an API token.
+## Output Files
 
-## Citations Enricher
+The pipeline generates these files in the project directory:
 
-The Citations Enricher tool uses the CourtListener API to add metadata to citations extracted from legal briefs.
-It takes a CSV file with citation data, looks up each citation in the CourtListener database, and adds additional
-information such as case name, court, date filed, and URLs.
+| File | Description |
+|------|-------------|
+| `AUTHORITIES.md` | Master authority list with citations and propositions |
+| `COURTLISTENER_RESULTS.json` | CourtListener download results (found/not_found) |
+| `CITECHECK.md` / `.pdf` | Cite-check report for all briefs |
+| `ISSUE_ANALYSIS.md` / `.pdf` | Deep issue analysis |
+| `MOOT_QA.md` / `.pdf` | Moot court Q&A preparation |
+| `authorities/*.txt` | Downloaded case opinion texts |
+| `authorities/rtf/*.rtf` | Westlaw RTF originals |
+| `.pipeline_state.json` | Pipeline state (for resume) |
 
-### Usage
+## Project Structure
 
-```bash
-# Enrich a citations CSV file with CourtListener data
-./citations_enricher.py citations_report.csv enriched_citations.csv
-
-# Specify a custom API token
-./citations_enricher.py citations_report.csv enriched_citations.csv --token YOUR_API_TOKEN
-
-# Specify a custom log file for failed lookups
-./citations_enricher.py citations_report.csv enriched_citations.csv --log my_errors.log
-
-# Specify custom column names if your CSV has different headers
-./citations_enricher.py citations_report.csv enriched_citations.csv --citation-column "Citation" --case-column "Case Title"
-
-# Include opinion text and save to the default directory (opinion_texts/)
-./citations_enricher.py citations_report.csv enriched_citations.csv --include-text
-
-# Include opinion text and save to a custom directory
-./citations_enricher.py citations_report.csv enriched_citations.csv --include-text --text-dir my_opinions
+```
+brief_analyzer/
+  __init__.py
+  __main__.py          # Entry point
+  cli.py               # Argument parsing
+  config.py            # Configuration dataclasses + YAML loading
+  pipeline.py          # Step orchestration
+  state.py             # Pipeline state persistence
+  steps/
+    s0_fetch_case.py          # txcourts.gov downloader
+    s1_convert_pdfs.py        # PDF to text
+    s2_extract_authorities.py # Claude-powered authority extraction
+    s2b_courtlistener.py      # CourtListener API downloads
+    s3_westlaw_download.py    # Semi-automated Westlaw downloads
+    s4_process_authorities.py # RTF conversion and renaming
+    s5_verify_authorities.py  # Authority file verification
+    s5_citecheck.py           # Parallel cite-checking
+    s6_issue_analysis.py      # Issue analysis generation
+    s7_moot_qa.py             # Moot court Q&A generation
+    s8_generate_pdfs.py       # PDF generation via pandoc
+  prompts/
+    authority_extraction.py   # Prompt for authority extraction
+    citecheck.py              # Prompt for cite-checking
+    issue_analysis.py         # Prompt for issue analysis
+    moot_qa.py                # Prompt for moot Q&A
+  utils/
+    citation_parser.py        # Citation regex extraction
+    claude_runner.py          # Claude API wrapper
+    file_utils.py             # Filename sanitization, file finding
+    pdf_utils.py              # PDF generation helpers
 ```
 
-### Input Format
+## CourtListener Coverage
 
-By default, the script looks for:
-- A "Citation" column containing the citation to look up (e.g., "410 U.S. 113")
-- A "Case Title" column with the case name (e.g., "Roe v. Wade")
+CourtListener provides free access to opinions from:
+- U.S. Supreme Court (U.S. Reports)
+- Federal circuit courts (F.2d, F.3d, F.4th)
+- Federal district courts (F. Supp., F. Supp. 2d)
+- Texas state courts (S.W.2d, S.W.3d)
 
-The script will:
-- Skip citations that start with "No." (case numbers rather than formal citations)
-- Format citations with case names when appropriate
+Coverage varies. In testing:
+- Franklyn case (44 authorities): 43 of 44 found (98%)
+- Roberts case (83 authorities): 64 of 83 found (77%)
 
-### Output Format
+Cases not found are typically recent (2020+), unpublished (WL-only cites), or from less-covered reporters.
 
-The output CSV file will contain all the original columns plus additional columns with the CourtListener data:
+## License
 
-- `cl_opinion_id` - The opinion ID in CourtListener
-- `cl_case_name` - The case name
-- `cl_court` - The court that issued the opinion
-- `cl_date_filed` - The date the opinion was filed
-- `cl_absolute_url` - The URL to view the opinion on CourtListener
-- `cl_other_citations` - Other citation forms for this case
-
-If `--include-text` is specified, these additional columns will be included:
-- `cl_text_file` - Path to the file containing the full opinion text
-- `cl_text_preview` - A preview of the opinion text (first 300 characters) 
+Private repository. Not for distribution.

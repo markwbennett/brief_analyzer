@@ -1,50 +1,45 @@
-# Environment variables
-.env
-.env.local
-.env.production
-.env.staging
-
-# Credentials and keys
-*.key
-*.pem
-*.p12
-*.pfx
-*secret*
-*password*
-*credential*
-
-# Virtual environments
-.venv/
-venv/
-env/
-
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
+*.py[cod]
+*$py.class
 *.so
+*.egg-info/
+dist/
+build/
+*.egg
 
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
+# Virtual environments
+venv/
+.venv/
+env/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# Logs
-*.log
-logs/
+# OS
+.DS_Store
+Thumbs.db
 
-# Data files (potentially sensitive)
-*.csv
-*.xlsx
-*.xls
-data/
-*.db
-*.sqlite 
+# Project data (case-specific, not code)
+*.pdf
+*.rtf
+*.html
+authorities/
+AUTHORITIES.md
+CITECHECK.md
+ISSUE_ANALYSIS.md
+MOOT_QA.md
+COURTLISTENER_RESULTS.json
+.pipeline_state.json
+SESSION_NOTES.md
+PROGRESS.md
+filings_manifest.json
+case_info.json
+
+# Secrets
+.env
+*.env
