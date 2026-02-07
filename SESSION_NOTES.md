@@ -1,74 +1,96 @@
-# Session Notes - 2025-02-06
+# Session Notes - 2026-02-07
 
 ## Work Completed
 
-### 1. Ran full pipeline on case 14-25-00079-CR
-- Output in `~/Discovery/14-25-00079-CR/`
-- 104 total authorities: 74 from CourtListener, 30 from Westlaw
-- 3 briefs cite-checked (Appellant, State, Reply)
-- Generated CITECHECK.pdf, ISSUE_ANALYSIS.pdf, MOOT_QA.pdf
+### Cite-checker purpose, advocacy, and relevance awareness
 
-### 2. Fixed ci() grouping logic
-- **Problem**: Prompt hardcoded groups of ~40, split before CourtListener filtering
-- **Fix**: Prompt now outputs all citations in a single ci() block. Splitting into equal groups of <50 happens in the Westlaw step, after CourtListener downloads reduce the list
-- Formula: `math.ceil(n / 49)` groups, distributed evenly
-- File: `brief_analyzer/prompts/authority_extraction.py`, `brief_analyzer/steps/s3_westlaw_download.py`
+Addressed three interrelated biases in the cite-check pipeline that caused it to penalize advocacy as error and miss relevance gaps:
 
-### 3. Fixed Westlaw download pipeline
-- **Problem**: Playwright `accept_downloads` didn't catch Westlaw's async hex-named file delivery; file watcher watched the wrong directory
-- **Fix**: Set `downloads_path` on browser launch to a temp dir, added `_collect_chromium_downloads()` to find hex-named ZIPs, unzip them, and move RTFs to `authorities/rtf/`
-- Also added `page.on("download", handler)` as a belt-and-suspenders approach
-- File watcher now monitors Chromium download dir, `rtf/`, and `~/Downloads` for ANY new file (not just .zip/.rtf)
-- File: `brief_analyzer/steps/s3_westlaw_download.py`
+#### 1. Added `classify_brief_type()` to `file_utils.py` (line 120)
+- Determines party (`appellant`/`state`/`unknown`) and brief type (`opening`/`response`/`reply`/`unknown`) from filename
+- Used to provide context to the extraction prompt
 
-### 4. Added Westlaw auto-login from Doppler
-- **Problem**: Credentials had to be entered manually each run
-- **Fix**: `config.py` now loads `WESTLAW_USERNAME`/`WESTLAW_PASSWORD` from env vars or Doppler. Login form is auto-filled and submitted.
-- Thomson Reuters SSO popup windows are detected via `context.on("page", handler)` and credentials filled there too
-- File: `brief_analyzer/config.py`, `brief_analyzer/steps/s3_westlaw_download.py`
+#### 2. Rewrote `EXTRACT_PROMPT` in `s5_citecheck.py` (line 24)
+- Now includes brief type/party context at the top
+- Extracts two new fields per citation:
+  - `purpose`: `supporting` | `extending` | `critiquing` | `background`
+  - `argument_context`: 1-sentence description of the legal argument
+- `REPLY_GUIDANCE` constant (line 60) provides reply-brief-specific classification hints
+- Reply briefs get guidance that string cites after "the State relies on..." are likely `critiquing`
 
-### 5. Fixed RTF process step looking in wrong directory
-- **Problem**: Process step looked for RTFs in `authorities/` but downloads now land in `authorities/rtf/`
-- **Fix**: Process step reads from `rtf/`, converts with textutil, renames by parsed citation, moves `.txt` up to `authorities/`
-- File: `brief_analyzer/steps/s4_process_authorities.py`
+#### 3. Updated `_extract_pairs()` in `s5_citecheck.py` (line 76)
+- Accepts `brief_type: dict` parameter
+- Formats brief type article/label/party and reply guidance into the prompt
 
-### 6. Fixed companion case disambiguation
-- **Problem**: When two cases share the same reporter citation (e.g., Abdnor and Highwarden both at 871 S.W.2d 726), verify and citecheck returned the first alphabetical match
-- **Fix**: Both `_match_authority` (verify) and `_find_authority_file` (citecheck) now collect all matches and disambiguate by case name keywords
-- Files: `brief_analyzer/steps/s5_verify_authorities.py`, `brief_analyzer/steps/s5_citecheck.py`
+#### 4. Rewrote `VERIFY_PROMPT` in `s5_citecheck.py` (line 203)
+- Purpose-specific evaluation:
+  - **supporting**: standard check PLUS relevance check (`on_point`/`analogous`/`off_point`)
+  - **extending**: graded as `Advocacy` (not an error), with `advocacy_gap` description
+  - **critiquing**: graded as `Critique-Valid` or `Critique-Questionable`
+  - **background**: light-touch check
+- New JSON output fields: `purpose`, `relevance`, `relevance_note`, `advocacy_gap`
 
-### 7. Removed --add-dir from analysis and moot QA steps
-- **Problem**: `--add-dir authorities/` loaded all 104 case files into `claude --print` context, causing a 10+ hour hang
-- **Fix**: Removed `add_dirs` param — citecheck results already contain relevant authority excerpts
-- Files: `brief_analyzer/steps/s6_issue_analysis.py`, `brief_analyzer/steps/s7_moot_qa.py`
+#### 5. Updated `_verify_authority()` in `s5_citecheck.py` (line 249)
+- Passes `purpose` and `argument_context` in the proposition block sent to Claude
+
+#### 6. Rewrote `_format_report()` in `s5_citecheck.py` (line 348)
+- Report organized into sections:
+  - **Citation Accuracy**: real errors (Minor/Moderate/Significant/Critical)
+  - **Relevance Gaps**: verified citations where authority is analogous/off_point
+  - **Advocacy Targets**: extending citations with gap descriptions
+  - **Reply-Brief Critiques**: critiquing citations with validity assessment
+  - **Error Summary Table**: accuracy errors only
+- Summary line includes counts for each category
+
+#### 7. Wired up brief type in `run()` (line 530)
+- Classifies each brief after `find_brief_texts()`
+- Passes brief type to `_extract_pairs()`
+- Purpose/context flows through grouping to verification unchanged
+
+#### 8. Updated `issue_analysis.py` — both `build_prompt()` and `build_tool_prompt()`
+- Replaced "actually hold" with "what they hold and how each side uses them"
+- Replaced "Read the actual authority text files...to verify" with "...to understand"
+- Added to Important Notes:
+  - Distinguish misrepresentation (error) from broad reading (advocacy)
+  - Evaluate analogical strength when authorities involve different offenses
+  - Use cite-check report categories (accuracy/relevance/advocacy/critique) rather than treating all findings as errors
+- Expanded Analysis section with analogy evaluation and advocacy assessment
 
 ## Git Commits Made
-- `253e228` - Fix Westlaw download pipeline and ci() grouping
-- `87f81b9` - Disambiguate companion cases sharing the same citation
-- `35bdc94` - Remove --add-dir from analysis and mootqa steps
+- (pending — this session)
 
 ## Current State
-- Pipeline fully functional end-to-end
-- Case 14-25-00079-CR analysis complete in `~/Discovery/14-25-00079-CR/`
-- All code pushed to `origin/main`
+- All changes made, imports verified, `classify_brief_type()` tested against actual case filenames
+- `CITECHECK.md` and `ISSUE_ANALYSIS.md` in `~/Discovery/14-25-00079-CR/` need to be deleted and re-generated to see the new behavior
+- Pipeline architecture unchanged: same parallel execution, retry logic, authority matching
 
 ## Next Session Recommendations
-- The analysis/mootqa steps no longer have access to full authority texts. If deeper authority analysis is needed, consider passing only the authorities referenced in the citecheck (not all 104).
-- The citation parser (`parse_case_from_text`) produces verbose filenames from Westlaw RTFs (includes full party names like "JOHN DEN, ex dem. JAMES B. MURRAY..."). Could be cleaned up to just use short-form case names.
-- The `_wait_for_user` non-interactive mode still has rough edges — the iTerm tab approach was abandoned. Current file-watcher approach works but depends on Westlaw's delivery mechanism continuing to use hex-named files.
-- Consider adding a `--force` flag to the pipeline to skip "already exists" checks without manually deleting output files.
+- Delete `CITECHECK.md` and re-run `--step citecheck` on 14-25-00079-CR to verify:
+  - Reply-brief string cites (Jefferson, Jourdan, Landrian, Pizzo, Vick, Young) appear under "Reply-Brief Critiques"
+  - Moreno, Castoreno, Barnes etc. appear under "Advocacy Targets"
+  - State's non-trafficking citations flagged under "Relevance Gaps"
+- Delete `ISSUE_ANALYSIS.md` and re-run `--step analysis` to verify Moreno is treated as advocacy, State's analogical argument is evaluated for strength
+- Consider whether `classify_brief_type()` needs additional patterns for other jurisdictions/filing conventions
+- The `--force` flag recommendation from last session still stands
 
 ## Quick Reference
 
-### Key Functions Modified
-- `_split_into_groups(cites, max_per_group=49)` — equal-size group splitting in `s3_westlaw_download.py`
-- `_collect_chromium_downloads(chromium_dl_dir, dest_dir)` — handles hex-named ZIP extraction
-- `_fill_credentials_on_page(target_page, config)` — auto-login helper
-- `_find_authority_file(case_name, volume, reporter, page, auth_files)` — now disambiguates companion cases
-- `_match_authority(case, auth_files)` — same disambiguation in verify step
+### New/Modified Functions
+- `classify_brief_type(filename) -> dict` — `file_utils.py:120` — returns `{party, brief_type}`
+- `_extract_pairs(brief_name, brief_text, model, brief_type)` — `s5_citecheck.py:76` — now accepts brief_type
+- `_verify_authority(authority_file, authority_text, propositions, model)` — `s5_citecheck.py:249` — now passes purpose/context
+- `_format_report(brief_name, pairs)` — `s5_citecheck.py:348` — sectioned report format
 
-### Environment
-- Westlaw creds: `doppler secrets get WESTLAW_USERNAME --plain` / `WESTLAW_PASSWORD`
-- CourtListener token: `COURTLISTENER_TOKEN` env var
-- Always run with `PYTHONUNBUFFERED=1` from Claude Code
-- Pipeline state in `.pipeline_state.json` — manually edit `"running"` to `"pending"` if process is killed
+### New Severity Grades
+- `Advocacy` — extending citations (not an error)
+- `Critique-Valid` — reply-brief critique is accurate
+- `Critique-Questionable` — reply-brief critique is debatable
+
+### New Citation Fields (extraction)
+- `purpose`: `supporting` | `extending` | `critiquing` | `background`
+- `argument_context`: 1-sentence legal argument description
+
+### New Verification Fields
+- `relevance`: `on_point` | `analogous` | `off_point`
+- `relevance_note`: explanation of relevance gap
+- `advocacy_gap`: what case holds vs. what brief argues (extending only)

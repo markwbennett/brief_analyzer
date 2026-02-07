@@ -39,6 +39,8 @@ class ProjectConfig:
     westlaw: WestlawConfig = field(default_factory=WestlawConfig)
     pandoc: PandocConfig = field(default_factory=PandocConfig)
     claude_model: str = "opus"
+    extraction_model: str = "haiku"
+    verification_model: str = "opus"
     parallel_agents: int = 4
 
     @property

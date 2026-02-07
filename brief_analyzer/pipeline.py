@@ -23,7 +23,7 @@ STEP_RUNNERS = {
     "authorities": extract_authorities,
     "courtlistener": courtlistener_download,
     "westlaw": westlaw_download,
-    "process": process_authorities,
+    "rtf2text": process_authorities,
     "verify": verify_authorities,
     "citecheck": citecheck,
     "analysis": issue_analysis,

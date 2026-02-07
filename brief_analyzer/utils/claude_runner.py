@@ -1,5 +1,6 @@
 """Subprocess wrapper for invoking claude --print."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,12 +29,17 @@ def run_claude(
         for d in add_dirs:
             cmd.extend(["--add-dir", str(d)])
 
+    # Strip ANTHROPIC_API_KEY so claude uses the access token, not a capped API key
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+
     result = subprocess.run(
         cmd,
         input=prompt,
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
 
     if result.returncode != 0:

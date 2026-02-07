@@ -192,4 +192,4 @@ Cases not found are typically recent (2020+), unpublished (WL-only cites), or fr
 
 ## License
 
-Private repository. Not for distribution.
+MIT License. See [LICENSE](LICENSE) for details.

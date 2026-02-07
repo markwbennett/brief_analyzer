@@ -117,6 +117,34 @@ def find_brief_texts(project_dir: Path) -> list[Path]:
     return txts
 
 
+def classify_brief_type(filename: str) -> dict:
+    """Classify a brief by type and party from its filename.
+
+    Returns dict with:
+      - party: "appellant" | "state" | "unknown"
+      - brief_type: "opening" | "response" | "reply" | "unknown"
+    """
+    name_lower = filename.lower()
+    is_reply = "reply brief" in name_lower or "reply to" in name_lower
+
+    party = "unknown"
+    brief_type = "unknown"
+
+    if "- state" in name_lower or "state's" in name_lower:
+        party = "state"
+    elif "- appellant" in name_lower or "appellant's" in name_lower:
+        party = "appellant"
+
+    if is_reply:
+        brief_type = "reply"
+    elif party == "state":
+        brief_type = "response"
+    elif party == "appellant":
+        brief_type = "opening"
+
+    return {"party": party, "brief_type": brief_type}
+
+
 def find_all_texts(project_dir: Path) -> list[Path]:
     """Find ALL .txt files in the project directory (for authority extraction).
 

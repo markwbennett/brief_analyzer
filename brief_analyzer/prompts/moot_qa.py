@@ -57,7 +57,7 @@ Identify the 3 questions that are most likely to determine the outcome. For each
 - The question
 - Why it matters
 - How each side should answer
-- What the answer likely is
+- Which side has the better of the argument on the briefs
 
 ## Guidelines
 - Frame questions as a judge would -- pointed, specific, testing the limits of each argument
@@ -67,6 +67,79 @@ Identify the 3 questions that are most likely to determine the outcome. For each
 - Include questions that test whether counsel knows the record
 - Questions should reflect the actual issues and authorities in THIS case
 - Read key authorities in authorities/ to craft precise questions about holdings
+- Aim for 10-15 questions per side in Parts One and Two
+
+Output the full content of MOOT_QA.md now. Do not use the Write tool. Print it directly to stdout."""
+
+
+def build_tool_prompt(
+    brief_paths: list[str],
+    issue_analysis_path: str,
+    citecheck_path: str,
+    authorities_dir: str,
+) -> str:
+    """Build a tool-based moot court Q&A prompt.
+
+    Instead of embedding all file contents, tells Claude to read files via tools.
+    """
+    brief_list = "\n".join(f"- {p}" for p in brief_paths)
+
+    return f"""You are a seasoned appellate judge preparing for oral argument in a Texas criminal appeal.
+
+## Files to Read
+
+Read each of these files using the Read tool before beginning your work:
+
+**Briefs:**
+{brief_list}
+
+**Issue Analysis:**
+- {issue_analysis_path}
+
+**Cite-Check Report:**
+- {citecheck_path}
+
+**Authority texts are in:**
+- {authorities_dir}/
+
+Read all briefs, the issue analysis, and the cite-check report first. Then read specific authority texts as needed.
+
+## Instructions
+
+Produce MOOT_QA.md -- a comprehensive moot court preparation document. Structure it as follows:
+
+### Part One: Questions for Appellant
+For each question:
+- **Q**: The question as a judge would ask it
+- **Why the court asks this**: What concern or issue motivates this question
+- **Suggested answer**: The strongest response, with citations
+- **Follow-up**: The likely follow-up question
+- **Trap to avoid**: What NOT to say and why
+
+### Part Two: Questions for the State/Appellee
+Same format as Part One.
+
+### Part Three: Questions for Either Side
+Questions that could be directed to either party, same format.
+
+### Part Four: Rapid-Fire Preparation
+10 short-answer questions with concise (1-2 sentence) answers for quick review.
+
+### Part Five: The Questions That Will Decide the Case
+Identify the 3 questions that are most likely to determine the outcome. For each:
+- The question
+- Why it matters
+- How each side should answer
+- Which side has the better of the argument on the briefs
+
+## Guidelines
+- Frame questions as a judge would -- pointed, specific, testing the limits of each argument
+- Use the cite-check findings to craft questions that expose weaknesses
+- Include questions about the implications of ruling for each side
+- Include questions about unpublished authorities and their weight
+- Include questions that test whether counsel knows the record
+- Questions should reflect the actual issues and authorities in THIS case
+- Read key authorities in {authorities_dir}/ to craft precise questions about holdings
 - Aim for 10-15 questions per side in Parts One and Two
 
 Output the full content of MOOT_QA.md now. Do not use the Write tool. Print it directly to stdout."""

@@ -9,10 +9,12 @@ When run non-interactively, waits for file changes in the download dir.
 
 import json
 import os
+import random
 import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from ..config import ProjectConfig
 from ..utils.citation_parser import extract_ci_searches
@@ -32,18 +34,19 @@ SELECTORS = {
         'button[aria-label="Search"]'
     ),
     "select_all_checkbox": (
-        '#selectAllCheckbox, '
-        '[data-testid="selectAllCheckbox"], '
-        'input[aria-label="Select All"]'
+        '#co_searchHeader_selectAll'
     ),
     "download_button": (
-        '#deliveryButton, '
-        '[data-testid="deliveryButton"], '
-        'button[aria-label="Download"]'
+        '#deliveryLinkButton1'
     ),
-    "delivery_format_rtf": (
-        'option[value="Rtf"], '
-        '[data-testid="formatRtf"]'
+    "delivery_format_fulltext": (
+        '#co_delivery_format_fulltext'
+    ),
+    "delivery_file_container": (
+        '#co_delivery_fileContainer'
+    ),
+    "delivery_download_submit": (
+        '#co_deliveryDownloadButton'
     ),
     "username_input": (
         '#Username, '
@@ -262,7 +265,6 @@ def run(config: ProjectConfig):
         _handle_client_matter(page, config)
 
         # Step 3: ci() searches (all citations go through ci())
-        print("\n  NOTE: Set the Westlaw data source to 'All State & Federal' before searching.")
         for i, search in enumerate(ci_searches, 1):
             print(f"\n--- ci() search {i}/{len(ci_searches)} ---")
             _do_ci_search(page, search, download_dir, chromium_dl_dir)
@@ -280,7 +282,6 @@ def run(config: ProjectConfig):
             print(f"  ({zip_count} ZIP file(s) to unpack in process step)")
         print(f"{'='*50}")
 
-        _wait_for_user("\nPress Enter to close the browser...", download_dir)
         browser.close()
 
 
@@ -366,6 +367,36 @@ def _do_login(page, config: ProjectConfig):
     if not filled:
         print(">>> Please log in to Westlaw in the browser window.")
 
+    # Thomson Reuters sometimes redirects to a separate password page
+    # after submitting the username. Watch for it and fill password there.
+    if filled and config.westlaw.password:
+        try:
+            page.wait_for_url("**/u/login/password**", timeout=8000)
+            print(f"  Redirected to password page: {page.url[:80]}")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            pw_el = page.locator(SELECTORS["password_input"]).first
+            pw_el.fill(config.westlaw.password, timeout=5000)
+            print("  Filled password on second page.")
+            try:
+                sign_in_btn = page.locator(
+                    'button:has-text("Sign in"), '
+                    'button:has-text("Sign In"), '
+                    'input[type="submit"]'
+                ).first
+                sign_in_btn.click(timeout=5000)
+                print("  Submitted password form.")
+            except Exception:
+                try:
+                    pw_el.press("Enter")
+                    print("  Pressed Enter to submit password.")
+                except Exception:
+                    print("  Could not auto-submit password page. Please click Sign In.")
+        except Exception:
+            pass  # No redirect to password page -- first page worked or user is handling it
+
     # Wait for redirect to next.westlaw.com (up to 3 minutes for MFA, popup, etc.)
     try:
         page.wait_for_url("**next.westlaw.com/**", timeout=180000)
@@ -396,6 +427,37 @@ def _do_login(page, config: ProjectConfig):
     except Exception:
         pass
 
+    _delay()
+
+    # Handle Client ID / Continue interstitial page
+    _handle_continue_page(page)
+
+
+def _delay(lo: float = 1.0, hi: float = 3.0):
+    """Random delay to account for slow page loading."""
+    time.sleep(random.uniform(lo, hi))
+
+
+def _handle_continue_page(page):
+    """Click 'Continue' on the Client ID interstitial page if it appears."""
+    try:
+        continue_btn = page.locator(
+            'input[value="Continue"], '
+            'button:has-text("Continue")'
+        ).first
+        if continue_btn.is_visible(timeout=5000):
+            print("  Client ID page detected. Clicking Continue...")
+            _delay(0.5, 1.5)
+            continue_btn.click()
+            _delay()
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            print(f"  Continued to: {page.url[:80]}")
+    except Exception:
+        pass  # No Continue page -- already on main Westlaw
+
 
 def _handle_client_matter(page, config: ProjectConfig):
     """Fill client/matter dialog if it appears."""
@@ -416,69 +478,66 @@ def _handle_client_matter(page, config: ProjectConfig):
 
 def _do_ci_search(page, search_term: str, download_dir: Path, chromium_dl_dir: Path):
     """Run a ci() search and download results as RTF."""
-    # Navigate to main search if not there
-    if "search/home" not in page.url.lower():
+    # Build results URL directly -- no need to fill search box or click Search
+    encoded_query = quote(f"adv: {search_term}")
+    results_url = (
+        f"https://next.westlaw.com/Search/Results.html"
+        f"?query={encoded_query}"
+        f"&jurisdiction=ALLCASES"
+        f"&contentType=CASE"
+        f"&transitionType=Search"
+        f"&contextData=%28sc.Default%29"
+    )
+    print(f"  Navigating directly to search results...")
+    _delay()
+    page.goto(results_url, timeout=60000)
+
+    # Wait for results to render (Select All checkbox appears when ready)
+    try:
+        select_all = page.locator(SELECTORS["select_all_checkbox"]).first
+        select_all.wait_for(state="visible", timeout=30000)
+        select_all.click()
+        print("  Clicked 'Select All'.")
+        _delay(1.0, 2.0)
+    except Exception as e:
+        print(f"  Could not click Select All: {e}")
+
+    # Click download icon to open delivery dialog
+    try:
+        dl_btn = page.locator(SELECTORS["download_button"]).first
+        dl_btn.wait_for(state="visible", timeout=10000)
+        dl_btn.click()
+        print("  Clicked download icon. Waiting for delivery dialog...")
+        _delay(2.0, 4.0)
+
+        # Ensure format is RTF and container is ZIP (they default to this, but be safe)
         try:
-            page.goto("https://next.westlaw.com/search/home.html", timeout=15000)
-            page.wait_for_load_state("networkidle", timeout=10000)
+            fmt_select = page.locator(SELECTORS["delivery_format_fulltext"]).first
+            if fmt_select.is_visible(timeout=5000):
+                fmt_select.select_option("Rtf")
+                _delay(0.5, 1.0)
+        except Exception:
+            pass
+        try:
+            container_select = page.locator(SELECTORS["delivery_file_container"]).first
+            if container_select.is_visible(timeout=3000):
+                container_select.select_option("MultipleFileZip")
+                _delay(0.5, 1.0)
         except Exception:
             pass
 
-    # Fill search box
-    try:
-        search_el = page.locator(SELECTORS["search_box"]).first
-        search_el.click()
-        search_el.fill(search_term)
-        print(f"  Filled search: {search_term[:80]}...")
+        # Click the Download submit button in the dialog
+        submit_btn = page.locator(SELECTORS["delivery_download_submit"]).first
+        submit_btn.wait_for(state="visible", timeout=10000)
+        submit_btn.click()
+        print("  Clicked 'Download' in delivery dialog.")
+        _delay(2.0, 4.0)
     except Exception as e:
-        print(f"  Could not fill search box: {e}")
-        print("  Please paste the search manually:")
-        print(f"  {search_term}")
+        print(f"  Could not auto-download: {e}")
 
-    print(">>> Please click 'Search' in the browser.")
-    # Wait for results page
-    try:
-        page.wait_for_url("**/search/**", timeout=120000)
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        print("  Timeout waiting for results. Please complete the search manually.")
-
-    # Try to select all and download
-    _download_results(page, download_dir, chromium_dl_dir)
-
-
-def _download_results(page, download_dir: Path, chromium_dl_dir: Path):
-    """Attempt to select all results and download as RTF."""
-    print("  Attempting to download results...")
-    print("  If automatic download fails, please download manually as RTF.")
-    print(f"  Save to: {download_dir}")
-
-    # Try select all
-    try:
-        select_all = page.locator(SELECTORS["select_all_checkbox"]).first
-        if select_all.is_visible(timeout=5000):
-            select_all.click()
-            time.sleep(1)
-    except Exception:
-        print("  Could not auto-select results. Please select them manually.")
-
-    # Try download
-    try:
-        dl_btn = page.locator(SELECTORS["download_button"]).first
-        if dl_btn.is_visible(timeout=5000):
-            dl_btn.click()
-            time.sleep(2)
-            # Select RTF format if dropdown appears
-            try:
-                rtf_opt = page.locator(SELECTORS["delivery_format_rtf"]).first
-                if rtf_opt.is_visible(timeout=3000):
-                    rtf_opt.click()
-            except Exception:
-                pass
-    except Exception:
-        print("  Could not auto-click download. Please download manually.")
-
+    # Wait for download files to arrive
     _wait_for_user("  Waiting for download to complete...", download_dir, chromium_dl_dir)
+
 
 
 def _merge_ci_blocks(ci_blocks: list[str]) -> list[str]:

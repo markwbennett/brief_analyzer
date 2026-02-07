@@ -6,6 +6,8 @@ before cite-checking begins.
 """
 
 import re
+import sys
+import time
 from pathlib import Path
 
 from ..config import ProjectConfig
@@ -105,10 +107,11 @@ def _parse_authorities_md(text: str) -> list[dict]:
     """Parse AUTHORITIES.md and extract case citation info.
 
     Returns list of dicts with: full_entry, case_name, volume, reporter, page,
-    wl_year, wl_number, match_names.
+    wl_year, wl_number, match_names, cited_by, proposition.
     """
     cases = []
     in_cases_section = False
+    current_case = None
 
     for line in text.split("\n"):
         if line.strip() == "## Cases":
@@ -119,12 +122,24 @@ def _parse_authorities_md(text: str) -> list[dict]:
         if not in_cases_section:
             continue
 
-        m = CASE_ENTRY_RE.match(line.strip())
+        stripped = line.strip()
+
+        # "- Cited by:" line belongs to the current case
+        if stripped.startswith("- Cited by:") and current_case:
+            current_case["cited_by"] = stripped[len("- Cited by:"):].strip()
+            continue
+
+        # "- Proposition:" line belongs to the current case
+        if stripped.startswith("- Proposition:") and current_case:
+            current_case["proposition"] = stripped[len("- Proposition:"):].strip()
+            continue
+
+        m = CASE_ENTRY_RE.match(stripped)
         if not m:
             continue
 
         entry_text = m.group(1)
-        info = {
+        current_case = {
             "full_entry": entry_text,
             "case_name": "",
             "volume": "",
@@ -132,36 +147,44 @@ def _parse_authorities_md(text: str) -> list[dict]:
             "page": "",
             "wl_year": "",
             "wl_number": "",
+            "docket_number": "",
             "match_names": [],
+            "cited_by": "",
+            "proposition": "",
         }
 
         # Extract case name (everything before first comma that precedes a number)
         name_match = re.match(r"(.+?),\s*(?:No\.|[0-9])", entry_text)
         if name_match:
-            info["case_name"] = name_match.group(1).strip()
+            current_case["case_name"] = name_match.group(1).strip()
         else:
             # Fallback: everything before the first number sequence
             name_match2 = re.match(r"(.+?),\s", entry_text)
             if name_match2:
-                info["case_name"] = name_match2.group(1).strip()
+                current_case["case_name"] = name_match2.group(1).strip()
 
         # Extract matching names (handles generic parties, noise words, etc.)
-        info["match_names"] = _extract_match_names(info["case_name"])
+        current_case["match_names"] = _extract_match_names(current_case["case_name"])
 
         # Extract reporter citation
         cite_m = CITE_RE.search(entry_text)
         if cite_m:
-            info["volume"] = cite_m.group(1)
-            info["reporter"] = cite_m.group(2)
-            info["page"] = cite_m.group(3)
+            current_case["volume"] = cite_m.group(1)
+            current_case["reporter"] = cite_m.group(2)
+            current_case["page"] = cite_m.group(3)
 
         # Extract WL citation
         wl_m = WL_CITE_RE.search(entry_text)
         if wl_m:
-            info["wl_year"] = wl_m.group(1)
-            info["wl_number"] = wl_m.group(2)
+            current_case["wl_year"] = wl_m.group(1)
+            current_case["wl_number"] = wl_m.group(2)
 
-        cases.append(info)
+        # Extract docket number (e.g., "No. PD-0230-24", "No. 01-13-00994-CR")
+        docket_m = re.search(r"No\.\s+([\w-]+)", entry_text)
+        if docket_m:
+            current_case["docket_number"] = docket_m.group(1)
+
+        cases.append(current_case)
 
     return cases
 
@@ -236,7 +259,66 @@ def _match_authority(case: dict, auth_files: dict[str, str]) -> dict:
             if wl_str in text:
                 return {"status": "found", "file": fname, "match_method": "wl_in_content"}
 
-    # Strategy 5: name matching in filename
+    # Strategy 4b: docket number in file content
+    docket = case.get("docket_number", "")
+    if docket:
+        for fname, text in auth_files.items():
+            if docket in text:
+                return {"status": "found", "file": fname, "match_method": "docket_in_content"}
+
+    # Strategy 4c: raw citation string in file content
+    # For reporters not in our regex (S.W., Port., Hill, etc.), extract any
+    # "volume reporter page" pattern from the entry and search file content.
+    if not volume:
+        raw_cites = re.findall(r'\b(\d+\s+[A-Za-z][A-Za-z. \']+\s+\d+)\b',
+                               case["full_entry"])
+        for raw_cite in raw_cites:
+            raw_cite = raw_cite.strip()
+            if len(raw_cite) < 5:
+                continue
+            hits = [fname for fname, text in auth_files.items()
+                    if raw_cite in text[:2000]]
+            if len(hits) == 1:
+                return {"status": "found", "file": hits[0],
+                        "match_method": f"raw_cite_in_content ({raw_cite})"}
+
+    # Strategy 5: name matching in file content (handles misspellings in brief)
+    # Search the first 2000 chars of each file for party names.
+    # Uses prefix matching (min 4 chars) to handle common misspellings
+    # like Gonzalez/Gonzales, Lightsey/Lightsy, etc.
+    if match_names:
+        for name in match_names:
+            if name in GENERIC_PARTIES:
+                continue
+            # Use prefix (drop last 1-2 chars) to handle spelling variants
+            prefix = name[:max(4, len(name) - 2)] if len(name) > 4 else name
+            content_name_hits = []
+            for fname, text in auth_files.items():
+                header = text[:2000].lower()
+                if prefix in header:
+                    content_name_hits.append(fname)
+            if len(content_name_hits) == 1:
+                return {"status": "found", "file": content_name_hits[0],
+                        "match_method": f"name_in_content ({name})"}
+            if len(content_name_hits) > 1:
+                # Try narrowing with other party name
+                if len(match_names) > 1:
+                    other = [n for n in match_names if n != name and n not in GENERIC_PARTIES]
+                    for oname in other:
+                        both = [f for f in content_name_hits if oname in auth_files[f][:2000].lower()]
+                        if len(both) == 1:
+                            return {"status": "found", "file": both[0],
+                                    "match_method": f"both_names_in_content ({name}, {oname})"}
+                # Try narrowing by page number in file content
+                if page:
+                    page_hits = [f for f in content_name_hits
+                                 if re.search(r'\b' + re.escape(page) + r'\b',
+                                              auth_files[f][:2000])]
+                    if len(page_hits) == 1:
+                        return {"status": "found", "file": page_hits[0],
+                                "match_method": f"name_and_page_in_content ({name}, p.{page})"}
+
+    # Strategy 6: name matching in filename
     if not match_names:
         return {"status": "missing", "file": None, "match_method": None}
 
@@ -280,6 +362,35 @@ def _match_authority(case: dict, auth_files: dict[str, str]) -> dict:
     # Multiple matches, no secondary narrowing -- uncertain, pick first
     return {"status": "uncertain", "file": primary_matches[0],
             "match_method": f"name ({primary_name}, {len(primary_matches)} candidates)"}
+
+
+def _wait_for_missing(missing: list, config: ProjectConfig, timeout: int = 300):
+    """Wait for the user to add missing authority files.
+
+    Interactive: prompts for Enter.
+    Non-interactive: watches authorities/ for new .txt files.
+    """
+    is_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+
+    if is_tty:
+        input("\n  Press Enter after adding the missing files (or Enter to skip)...")
+        return
+
+    # Non-interactive: watch for new .txt files in authorities/
+    auth_dir = config.authorities_dir
+    snapshot = set(auth_dir.glob("*.txt"))
+    print(f"\n  Watching {auth_dir} for new .txt files (timeout {timeout}s)...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(5)
+        current = set(auth_dir.glob("*.txt"))
+        new_files = current - snapshot
+        if new_files:
+            names = [f.name[:60] for f in new_files]
+            print(f"  Detected {len(new_files)} new file(s): {names}")
+            time.sleep(2)
+            return
+    print(f"  Timeout waiting for missing authorities. Proceeding anyway.")
 
 
 def run(config: ProjectConfig):
@@ -342,14 +453,55 @@ def run(config: ProjectConfig):
         for r in missing:
             c = r["case"]
             print(f"    {c['full_entry']}")
+            if c.get("cited_by"):
+                print(f"      Cited by: {c['cited_by']}")
         print()
-        print(f"  {len(missing)} authorities are missing from authorities/.")
-        print("  Please download these before proceeding to cite-check.")
-        print("  You can re-run this step after adding the missing files:")
-        print(f"    python -m brief_analyzer --step verify \"{config.project_dir}\"")
-        raise RuntimeError(
-            f"{len(missing)} authorities missing. Download them and re-run the verify step."
-        )
+
+        # Write missing authorities.txt with full citation and brief info
+        missing_path = config.project_dir / "missing authorities.txt"
+        lines = []
+        lines.append(f"{len(missing)} authorities cited in the briefs have no matching text file.")
+        lines.append("")
+        for r in missing:
+            c = r["case"]
+            lines.append(c["full_entry"])
+            if c.get("cited_by"):
+                lines.append(f"  Cited by: {c['cited_by']}")
+            if c.get("proposition"):
+                lines.append(f"  Proposition: {c['proposition']}")
+            lines.append("")
+        missing_path.write_text("\n".join(lines))
+        print(f"  Wrote: {missing_path.name}")
+
+        print(f"\n  {len(missing)} authorities are missing from authorities/.")
+        print("  The ci() search included these citations but Westlaw did not return them.")
+        print("  This usually means the citation in the brief is wrong.")
+        print(f"  Please find the missing authorities and place .txt files in:")
+        print(f"    {config.authorities_dir}")
+
+        # Wait for user to add files, then re-verify
+        _wait_for_missing(missing, config)
+
+        # Re-scan and re-verify
+        auth_files = {}
+        for f in config.authorities_dir.glob("*.txt"):
+            auth_files[f.name] = f.read_text(errors="replace")
+        still_missing = []
+        for r in missing:
+            result = _match_authority(r["case"], auth_files)
+            if result["status"] == "missing":
+                still_missing.append(r)
+            else:
+                result["case"] = r["case"]
+                found.append(result)
+                print(f"    Found: {r['case']['case_name']}")
+
+        if still_missing:
+            names = [r["case"]["case_name"] for r in still_missing]
+            print(f"\n  Still missing {len(still_missing)}: {', '.join(names)}")
+            print("  Proceeding without them -- cite-check will note these as unavailable.")
+
+        missing = still_missing
 
     if uncertain:
         print(f"  {len(uncertain)} authorities matched by name only.")

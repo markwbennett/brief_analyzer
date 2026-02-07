@@ -1,25 +1,33 @@
 """Step 5: Cite-check briefs against authority texts.
 
-Three-phase approach:
-  5a. Claude extracts citation-proposition pairs from each brief (structured JSON).
-  5b. Python mechanically verifies: reporter cites, years, courts, quotations.
-  5c. Claude reviews only the ambiguous/failed cases for proposition accuracy.
+Two-phase approach:
+  5a. Claude extracts citation-proposition pairs from each brief (parallel).
+  5b. For each cited authority, Claude verifies ALL propositions against the
+      FULL text of the authority (parallel by authority).
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from ..config import ProjectConfig
-from ..utils.file_utils import find_brief_texts
+from ..utils.file_utils import classify_brief_type, find_brief_texts
 
 
 # --- Phase A: Extract citation-proposition pairs ---
 
 EXTRACT_PROMPT = """You are a legal citation extractor. Read this brief and extract every case citation with its context.
+
+## Brief Context
+
+This is a{brief_type_article} {brief_type_label} filed by the {party}.{reply_guidance}
+
+## Extraction Fields
 
 For each citation, output a JSON object with these fields:
 - case_name: the case name as cited (e.g., "Theus v. State")
@@ -33,6 +41,15 @@ For each citation, output a JSON object with these fields:
 - proposition: what the brief cites this case for (1-2 sentences)
 - quotation: any direct quotation from the case (verbatim from the brief); empty string if none
 - brief_page: approximate location in the brief (page number or section)
+- purpose: one of "supporting", "extending", "critiquing", or "background" (see definitions below)
+- argument_context: 1 sentence describing the legal argument this citation is part of
+
+## Purpose Definitions
+
+- **supporting**: standard affirmative cite -- the brief relies on the case's holding as-is to support its argument
+- **extending**: the brief argues the case's holding should apply more broadly or to new facts beyond its original context
+- **critiquing**: the brief argues this authority does NOT support the opposing party's position or is distinguishable
+- **background**: cited for uncontested general propositions (standard of review, procedural rules, etc.)
 
 Output ONLY a JSON array. No commentary, no markdown fencing. Just the raw JSON array.
 
@@ -40,16 +57,55 @@ BRIEF TEXT:
 
 {brief_text}"""
 
+REPLY_GUIDANCE = """
 
-def _extract_pairs(brief_name: str, brief_text: str, model: str) -> list[dict]:
+Reply-brief guidance for purpose classification:
+- String cites following phrases like "the State relies on...", "none of these cases...", "these cases do not...", or "unlike in..." are likely "critiquing" -- the brief is arguing these authorities don't support the opposing side
+- Citations that extend an opening-brief argument with new framing or applications are likely "extending"
+- Citations reaffirming the opening brief's own authorities are likely "supporting"
+"""
+
+
+def _claude_env():
+    """Return env dict with ANTHROPIC_API_KEY removed so claude uses the access token."""
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+    return env
+
+
+def _extract_pairs(brief_name: str, brief_text: str, model: str,
+                    brief_type: dict | None = None) -> list[dict]:
     """Phase A: Use Claude to extract citation-proposition pairs."""
-    prompt = EXTRACT_PROMPT.format(brief_text=brief_text)
+    if brief_type is None:
+        brief_type = {"party": "unknown", "brief_type": "unknown"}
+
+    # Build human-readable labels for the prompt
+    type_labels = {
+        "opening": "opening brief",
+        "response": "response brief",
+        "reply": "reply brief",
+        "unknown": "brief",
+    }
+    brief_type_label = type_labels.get(brief_type["brief_type"], "brief")
+    brief_type_article = "n" if brief_type_label[0] in "aeiou" else ""
+    party = brief_type.get("party", "unknown")
+
+    reply_guidance = REPLY_GUIDANCE if brief_type["brief_type"] == "reply" else ""
+
+    prompt = EXTRACT_PROMPT.format(
+        brief_text=brief_text,
+        brief_type_article=brief_type_article,
+        brief_type_label=brief_type_label,
+        party=party,
+        reply_guidance=reply_guidance,
+    )
 
     cmd = ["claude", "--print", "--model", model]
-    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True)
+    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=_claude_env())
 
     if result.returncode != 0:
-        print(f"  Extract failed for {brief_name}: {result.stderr[:200]}", file=sys.stderr)
+        err_msg = result.stderr.strip() or result.stdout.strip()
+        print(f"  Extract failed for {brief_name}: {err_msg[:300]}", file=sys.stderr)
         return []
 
     text = result.stdout.strip()
@@ -63,7 +119,6 @@ def _extract_pairs(brief_name: str, brief_text: str, model: str) -> list[dict]:
             return pairs
     except json.JSONDecodeError as e:
         print(f"  JSON parse failed for {brief_name}: {e}", file=sys.stderr)
-        # Try to salvage: find the array
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if match:
             try:
@@ -74,7 +129,7 @@ def _extract_pairs(brief_name: str, brief_text: str, model: str) -> list[dict]:
     return []
 
 
-# --- Phase B: Mechanical verification ---
+# --- Authority file matching ---
 
 def _find_authority_file(case_name: str, volume: str, reporter: str, page: str,
                          auth_files: dict[str, str]) -> tuple[str, str] | None:
@@ -102,20 +157,19 @@ def _find_authority_file(case_name: str, volume: str, reporter: str, page: str,
     if cite_matches:
         if len(cite_matches) == 1:
             return cite_matches[0]
-        # Multiple files share this citation — disambiguate by case name
+        # Multiple files share this citation -- disambiguate by case name
         if name_words:
             for fname, text in cite_matches:
                 fname_lower = fname.lower()
                 if any(w in fname_lower for w in name_words):
                     return (fname, text)
-        # No name match; return first as fallback
         return cite_matches[0]
 
     # Try matching by case name (first party before "v.")
     if case_name:
         first_party = case_name.split(" v.")[0].split(" v ")[0].strip()
         if first_party:
-            first_lower = first_party.lower().split()[-1]  # last word of first party
+            first_lower = first_party.lower().split()[-1]
             for fname, text in auth_files.items():
                 if first_lower in fname.lower():
                     return (fname, text)
@@ -134,7 +188,6 @@ def _find_authority_file(case_name: str, volume: str, reporter: str, page: str,
     if content_matches:
         if len(content_matches) == 1:
             return content_matches[0]
-        # Disambiguate by name
         if name_words:
             for fname, text in content_matches:
                 fname_lower = fname.lower()
@@ -145,194 +198,84 @@ def _find_authority_file(case_name: str, volume: str, reporter: str, page: str,
     return None
 
 
-def _verify_citation(pair: dict, auth_files: dict[str, str]) -> dict:
-    """Mechanically verify a single citation-proposition pair.
+# --- Phase B: Authority-centric Claude verification ---
 
-    Returns a result dict with verification status and any issues found.
-    """
-    result = {
-        "citation": f"{pair.get('case_name', '?')}, {pair.get('volume', '')} {pair.get('reporter', '')} {pair.get('page', '')}",
-        "proposition": pair.get("proposition", ""),
-        "issues": [],
-        "verified_mechanically": [],
-        "needs_claude_review": False,
-        "authority_file": None,
-        "authority_excerpt": "",
-    }
+VERIFY_PROMPT = """You are a legal cite-checker. Below is the FULL TEXT of a court opinion, followed by propositions from briefs that cite this case. Each proposition includes a "purpose" field that affects how you should evaluate it.
 
-    case_name = pair.get("case_name", "")
-    volume = pair.get("volume", "")
-    reporter = pair.get("reporter", "")
-    page = pair.get("page", "")
-    pin_cite = pair.get("pin_cite", "")
-    court = pair.get("court", "")
-    year = pair.get("year", "")
-    quotation = pair.get("quotation", "")
+## Mechanical checks (apply to ALL purposes)
 
-    # Find the authority file
-    match = _find_authority_file(case_name, volume, reporter, page, auth_files)
-    if not match:
-        result["issues"].append({
-            "type": "authority_not_found",
-            "severity": "Critical",
-            "detail": f"No authority file found for {result['citation']}",
-        })
-        result["needs_claude_review"] = True
-        return result
+For every proposition, check:
+1. Citation accuracy: reporter, pin cite, year, court -- do they match the opinion?
+2. If a quotation is provided, is it verbatim? Check for omissions, alterations, or context changes.
 
-    fname, auth_text = match
-    result["authority_file"] = fname
-    header = auth_text[:3000]
+## Purpose-specific evaluation
 
-    # Check reporter citation in authority text
-    if volume and reporter and page and reporter != "WL":
-        cite_str = f"{volume} {reporter} {page}"
-        if cite_str in auth_text:
-            result["verified_mechanically"].append("reporter_cite")
-        else:
-            result["issues"].append({
-                "type": "reporter_cite_mismatch",
-                "severity": "Significant",
-                "detail": f"Citation '{cite_str}' not found in authority text",
-            })
+**For "supporting" citations** (standard affirmative cite):
+- Does the authority support the stated proposition? Consider the full opinion.
+- RELEVANCE CHECK: Does the authority address the legal issue described in argument_context? If the authority involves a different offense or legal area, set relevance to "analogous" and explain the gap. If the authority is on point, set relevance to "on_point". If the authority has no meaningful connection, set relevance to "off_point".
+- Grade: "Verified" / "Minor" / "Moderate" / "Significant" / "Critical"
 
-    # Check year
-    if year:
-        if year in header:
-            result["verified_mechanically"].append("year")
-        else:
-            result["issues"].append({
-                "type": "year_mismatch",
-                "severity": "Minor",
-                "detail": f"Year '{year}' not found in authority header",
-            })
+**For "extending" citations** (advocacy -- the brief argues the holding should apply more broadly):
+- Describe what the case actually holds.
+- Describe what the brief argues it should mean.
+- Identify the gap the advocate needs to bridge.
+- Grade: "Advocacy" -- this is NOT an error grade. This identifies an advocacy target.
+- Still flag if the extension is unreasonable (e.g., the case holds the opposite) -- use "Critical" instead.
 
-    # Check court identification
-    if court:
-        court_checks = {
-            "Tex. Crim. App.": [r"Court\s+of\s+Criminal\s+Appeals", r"Tex\.\s*Crim\.\s*App"],
-            "Tex. App.": [r"Court\s+of\s+Appeals"],
-            "U.S.": [r"Supreme\s+Court.*United\s+States"],
-        }
-        court_found = False
-        for court_key, patterns in court_checks.items():
-            if court_key in court:
-                for pat in patterns:
-                    if re.search(pat, header, re.IGNORECASE):
-                        court_found = True
-                        break
-                if court_found:
-                    result["verified_mechanically"].append("court")
-                else:
-                    # Check if a DIFFERENT court is identified
-                    if "Court of Criminal Appeals" in header and "Tex. App." in court:
-                        result["issues"].append({
-                            "type": "court_misidentified",
-                            "severity": "Critical",
-                            "detail": f"Brief says '{court}' but authority is from CCA",
-                        })
-                    elif "Court of Appeals" in header and "Crim. App." in court:
-                        result["issues"].append({
-                            "type": "court_misidentified",
-                            "severity": "Critical",
-                            "detail": f"Brief says '{court}' but authority is from Court of Appeals",
-                        })
-                    else:
-                        result["needs_claude_review"] = True
-                break
+**For "critiquing" citations** (the brief argues this authority does NOT help the opposing side):
+- Verify the critique, not the affirmative proposition. Does the case actually fail to address the topic the brief says it doesn't address?
+- Grade: "Critique-Valid" (the critique is accurate -- the case does not address what the brief says it doesn't) or "Critique-Questionable" (the case does address the topic the brief claims it doesn't).
 
-    # Check quotation accuracy
-    if quotation and len(quotation) > 20:
-        # Normalize whitespace for comparison
-        q_norm = re.sub(r"\s+", " ", quotation.strip())
-        a_norm = re.sub(r"\s+", " ", auth_text)
+**For "background" citations** (uncontested general propositions):
+- Light-touch check: is the stated proposition substantively correct?
+- Grade: "Verified" or flag only if actually wrong.
 
-        if q_norm in a_norm:
-            result["verified_mechanically"].append("quotation_verbatim")
-        else:
-            # Try with some fuzzy matching -- strip punctuation differences
-            q_stripped = re.sub(r"[.,;:!?\"\'\-\u2014\u2013\u2018\u2019\u201c\u201d]", "", q_norm).lower()
-            a_stripped = re.sub(r"[.,;:!?\"\'\-\u2014\u2013\u2018\u2019\u201c\u201d]", "", a_norm).lower()
+## Output format
 
-            if q_stripped in a_stripped:
-                result["verified_mechanically"].append("quotation_minor_diffs")
-            else:
-                # Check if at least 80% of words match in sequence
-                q_words = q_stripped.split()
-                if len(q_words) >= 5:
-                    # Check for substantial substring match
-                    midpoint = len(q_words) // 2
-                    mid_phrase = " ".join(q_words[midpoint:midpoint+5])
-                    if mid_phrase in a_stripped:
-                        result["issues"].append({
-                            "type": "quotation_altered",
-                            "severity": "Moderate",
-                            "detail": "Quotation found in authority but with differences",
-                        })
-                        result["needs_claude_review"] = True
-                    else:
-                        result["issues"].append({
-                            "type": "quotation_not_found",
-                            "severity": "Significant",
-                            "detail": "Quoted text not found in authority",
-                        })
-                        result["needs_claude_review"] = True
-                        # Save excerpt for Claude review
-                        result["authority_excerpt"] = auth_text[:5000]
+Output a JSON array with one object per proposition:
+{{"index": <proposition number starting at 1>, "purpose": "supporting|extending|critiquing|background", "severity": "Verified|Minor|Moderate|Significant|Critical|Advocacy|Critique-Valid|Critique-Questionable", "quotation_accurate": true|false|null, "relevance": "on_point|analogous|off_point", "relevance_note": "<if analogous or off_point, explain what the case addresses vs. what the argument requires>", "explanation": "<1-2 sentences explaining your assessment>", "advocacy_gap": "<for extending only: what the case holds, what the brief argues, what gap must be bridged>"}}
 
-    # Proposition accuracy always needs Claude review
-    if pair.get("proposition"):
-        result["needs_claude_review"] = True
-        if not result["authority_excerpt"]:
-            result["authority_excerpt"] = auth_text[:5000]
+For fields that don't apply to a given purpose, use null. For example, advocacy_gap is null for supporting citations; relevance is null for background citations.
 
-    return result
+Output ONLY the JSON array. No commentary, no markdown fencing.
+
+=== AUTHORITY TEXT ===
+{authority_text}
+
+=== PROPOSITIONS TO VERIFY ===
+{propositions}"""
 
 
-# --- Phase C: Claude review of ambiguous cases ---
+def _verify_authority(authority_file: str, authority_text: str,
+                      propositions: list[dict], model: str) -> list[dict]:
+    """Send full authority text + all propositions to Claude for verification."""
+    prop_lines = []
+    for i, prop in enumerate(propositions, 1):
+        prop_lines.append(f"--- Proposition {i} (from {prop['brief_name']}) ---")
+        prop_lines.append(f"Citation as given: {prop.get('case_name', '?')}, "
+                          f"{prop.get('volume', '')} {prop.get('reporter', '')} {prop.get('page', '')}")
+        if prop.get("pin_cite"):
+            prop_lines.append(f"Pin cite: {prop['pin_cite']}")
+        purpose = prop.get("purpose", "supporting")
+        prop_lines.append(f"Purpose: {purpose}")
+        if prop.get("argument_context"):
+            prop_lines.append(f"Argument context: {prop['argument_context']}")
+        prop_lines.append(f"Proposition: {prop.get('proposition', '')}")
+        if prop.get("quotation"):
+            prop_lines.append(f'Quotation from brief: "{prop["quotation"]}"')
+        prop_lines.append("")
 
-REVIEW_PROMPT = """You are a legal cite-checker reviewing flagged citations. For each citation below, I provide:
-- The citation and proposition as stated in the brief
-- Any mechanical issues found
-- An excerpt from the authority text
+    prompt = VERIFY_PROMPT.format(
+        authority_text=authority_text,
+        propositions="\n".join(prop_lines),
+    )
 
-For each, assess:
-1. Does the authority actually support the proposition cited? (Critical if not)
-2. Is the characterization fair and accurate? (Significant if misleading)
-3. Are there any other issues?
-
-Grade each: Verified / Critical / Significant / Moderate / Minor
-
-Output a JSON array with one object per citation:
-{{"citation": "...", "proposition_accurate": true/false, "severity": "Verified|Critical|Significant|Moderate|Minor", "explanation": "..."}}
-
-Output ONLY the JSON array.
-
-CITATIONS TO REVIEW:
-
-{review_items}"""
-
-
-def _claude_review(items: list[dict], model: str) -> list[dict]:
-    """Phase C: Send ambiguous citations to Claude for review."""
-    if not items:
-        return []
-
-    review_text = ""
-    for i, item in enumerate(items, 1):
-        review_text += f"\n--- Citation {i} ---\n"
-        review_text += f"Citation: {item['citation']}\n"
-        review_text += f"Proposition: {item['proposition']}\n"
-        if item["issues"]:
-            review_text += f"Mechanical issues: {json.dumps(item['issues'])}\n"
-        if item["authority_excerpt"]:
-            review_text += f"Authority excerpt:\n{item['authority_excerpt']}\n"
-
-    prompt = REVIEW_PROMPT.format(review_items=review_text)
     cmd = ["claude", "--print", "--model", model]
-    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True)
+    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=_claude_env())
 
     if result.returncode != 0:
+        err_msg = result.stderr.strip() or result.stdout.strip()
+        print(f"    Verify failed for {authority_file}: {err_msg[:300]}", file=sys.stderr)
         return []
 
     text = result.stdout.strip()
@@ -351,129 +294,211 @@ def _claude_review(items: list[dict], model: str) -> list[dict]:
     return []
 
 
+def _verify_one_authority(args: tuple, max_retries: int = 3) -> tuple[str, list[dict]]:
+    """Wrapper for ProcessPoolExecutor with retry logic."""
+    import time
+    authority_file, authority_text, propositions, model = args
+    for attempt in range(max_retries):
+        results = _verify_authority(authority_file, authority_text, propositions, model)
+        if results:
+            return (authority_file, results)
+        if attempt < max_retries - 1:
+            wait = 30 * (attempt + 1)
+            print(f"    {authority_file}: retrying in {wait}s (attempt {attempt + 2}/{max_retries})")
+            time.sleep(wait)
+    return (authority_file, results)
+
+
 # --- Orchestration ---
 
-def _process_one_brief(args: tuple) -> tuple[str, str]:
-    """Process a single brief through all three phases."""
-    brief_name, brief_text, authorities_dir_str, model = args
-    auth_dir = Path(authorities_dir_str)
+def _group_by_authority(all_pairs: dict[str, list[dict]],
+                        auth_files: dict[str, str]) -> dict[str | None, list[dict]]:
+    """Group all citation-proposition pairs by authority file.
 
-    # Load all authority texts
-    auth_files = {}
-    for f in sorted(auth_dir.glob("*.txt")):
-        auth_files[f.name] = f.read_text(errors="replace")
+    all_pairs: {brief_name: [pair_dicts]}
+    auth_files: {filename: text}
 
-    # Phase A: Extract pairs
-    print(f"  [{brief_name}] Extracting citations...")
-    pairs = _extract_pairs(brief_name, brief_text, model)
-    if not pairs:
-        return (brief_name, f"Failed to extract citations from {brief_name}")
+    Returns: {authority_filename: [proposition_dicts with brief_name added]}
+    Pairs with no matching authority are collected under key None.
+    """
+    grouped = defaultdict(list)
 
-    print(f"  [{brief_name}] Found {len(pairs)} citations. Verifying mechanically...")
+    for brief_name, pairs in all_pairs.items():
+        for pair in pairs:
+            match = _find_authority_file(
+                pair.get("case_name", ""),
+                pair.get("volume", ""),
+                pair.get("reporter", ""),
+                pair.get("page", ""),
+                auth_files,
+            )
+            prop = dict(pair)
+            prop["brief_name"] = brief_name
+            if match:
+                fname, _ = match
+                prop["authority_file"] = fname
+                grouped[fname].append(prop)
+            else:
+                prop["authority_file"] = None
+                grouped[None].append(prop)
 
-    # Phase B: Mechanical verification
-    results = []
-    for pair in pairs:
-        result = _verify_citation(pair, auth_files)
-        results.append(result)
-
-    # Phase C: Claude review for ambiguous cases
-    needs_review = [r for r in results if r["needs_claude_review"]]
-    print(f"  [{brief_name}] {len(results) - len(needs_review)} verified mechanically, {len(needs_review)} need Claude review...")
-
-    # Batch review in groups of ~20
-    batch_size = 20
-    for i in range(0, len(needs_review), batch_size):
-        batch = needs_review[i:i+batch_size]
-        reviews = _claude_review(batch, model)
-
-        # Merge review results back
-        for j, review in enumerate(reviews):
-            if i + j < len(needs_review):
-                item = needs_review[i + j]
-                item["claude_review"] = review
-
-    # Format report
-    report = _format_report(brief_name, results)
-    return (brief_name, report)
+    return grouped
 
 
-def _format_report(brief_name: str, results: list[dict]) -> str:
-    """Format verification results into markdown."""
+def _format_report(brief_name: str, pairs: list[dict]) -> str:
+    """Format verification results for one brief into markdown."""
     lines = [f"### {brief_name} -- Cite-Check Report\n"]
 
-    # Count errors by severity
-    counts = {"Critical": 0, "Significant": 0, "Moderate": 0, "Minor": 0}
-    errors = []
-    for r in results:
-        for issue in r.get("issues", []):
-            sev = issue.get("severity", "Minor")
-            if sev in counts:
-                counts[sev] += 1
-            errors.append((r["citation"], issue))
-        review = r.get("claude_review", {})
-        if review and not review.get("proposition_accurate", True):
-            sev = review.get("severity", "Significant")
-            if sev in counts:
-                counts[sev] += 1
-            errors.append((r["citation"], {
-                "type": "proposition_inaccurate",
-                "severity": sev,
-                "detail": review.get("explanation", ""),
-            }))
+    # Categorize all pairs
+    accuracy_issues = []     # supporting/background with real errors
+    relevance_gaps = []      # supporting with analogous/off_point relevance
+    advocacy_targets = []    # extending citations
+    critiques = []           # critiquing citations
+    verified_items = []      # clean supporting/background
 
-    total_errors = sum(counts.values())
-    lines.append(f"**Summary**: {len(results)} citations checked, {total_errors} errors found "
-                 f"({counts['Critical']} critical, {counts['Significant']} significant, "
-                 f"{counts['Moderate']} moderate, {counts['Minor']} minor)\n")
+    counts = {
+        "Critical": 0, "Significant": 0, "Moderate": 0, "Minor": 0,
+        "Verified": 0, "Advocacy": 0,
+        "Critique-Valid": 0, "Critique-Questionable": 0, "Error": 0,
+    }
 
-    # Detail each citation
-    for r in results:
-        cite = r["citation"]
-        issues = r.get("issues", [])
-        review = r.get("claude_review", {})
-        verified = r.get("verified_mechanically", [])
+    for pair in pairs:
+        auth_file = pair.get("authority_file")
+        citation = (f"{pair.get('case_name', '?')}, "
+                    f"{pair.get('volume', '')} {pair.get('reporter', '')} {pair.get('page', '')}")
+        proposition = pair.get("proposition", "")
+        purpose = pair.get("purpose", "supporting")
+        argument_context = pair.get("argument_context", "")
+        verdict = pair.get("verdict")
 
-        if not issues and review.get("proposition_accurate", True):
-            status = "VERIFIED"
+        if verdict:
+            severity = verdict.get("severity", "Error")
+            explanation = verdict.get("explanation", "")
+            quot_accurate = verdict.get("quotation_accurate")
+            relevance = verdict.get("relevance")
+            relevance_note = verdict.get("relevance_note", "")
+            advocacy_gap = verdict.get("advocacy_gap", "")
         else:
-            worst = "Minor"
-            for issue in issues:
-                sev = issue.get("severity", "Minor")
-                if sev == "Critical":
-                    worst = "Critical"
-                elif sev == "Significant" and worst != "Critical":
-                    worst = "Significant"
-                elif sev == "Moderate" and worst not in ("Critical", "Significant"):
-                    worst = "Moderate"
-            if review and not review.get("proposition_accurate", True):
-                rev_sev = review.get("severity", "Significant")
-                if rev_sev == "Critical":
-                    worst = "Critical"
-                elif rev_sev == "Significant" and worst != "Critical":
-                    worst = "Significant"
-            status = worst
+            severity = "Error"
+            explanation = "No verification result returned"
+            quot_accurate = None
+            relevance = None
+            relevance_note = ""
+            advocacy_gap = ""
 
-        lines.append(f"#### {cite}")
-        lines.append(f"- **Cited for**: {r.get('proposition', 'N/A')}")
-        lines.append(f"- **Status**: {status}")
-        if r.get("authority_file"):
-            lines.append(f"- **Authority file**: {r['authority_file']}")
-        if verified:
-            lines.append(f"- **Mechanically verified**: {', '.join(verified)}")
-        for issue in issues:
-            lines.append(f"- **{issue['severity']}**: {issue['detail']}")
-        if review and review.get("explanation"):
-            lines.append(f"- **Claude review**: {review['explanation']}")
-        lines.append("")
+        if auth_file is None:
+            severity = "Critical"
+            explanation = f"No authority file found for {citation}"
 
-    # Error summary table
-    if errors:
+        if severity in counts:
+            counts[severity] += 1
+
+        entry = {
+            "citation": citation,
+            "proposition": proposition,
+            "purpose": purpose,
+            "argument_context": argument_context,
+            "severity": severity,
+            "explanation": explanation,
+            "quot_accurate": quot_accurate,
+            "auth_file": auth_file,
+            "relevance": relevance,
+            "relevance_note": relevance_note,
+            "advocacy_gap": advocacy_gap,
+        }
+
+        # Route to appropriate section
+        if severity == "Advocacy":
+            advocacy_targets.append(entry)
+        elif severity in ("Critique-Valid", "Critique-Questionable"):
+            critiques.append(entry)
+        elif relevance in ("analogous", "off_point") and severity == "Verified":
+            relevance_gaps.append(entry)
+        elif severity in ("Minor", "Moderate", "Significant", "Critical", "Error"):
+            accuracy_issues.append(entry)
+        else:
+            verified_items.append(entry)
+
+    # Summary line
+    n_accuracy = len(accuracy_issues)
+    n_relevance = len(relevance_gaps)
+    n_advocacy = len(advocacy_targets)
+    n_critiques = len(critiques)
+    n_verified = len(verified_items)
+    summary = (
+        f"**Summary**: {len(pairs)} citations checked. "
+        f"{n_accuracy} accuracy issue{'s' if n_accuracy != 1 else ''} "
+        f"({counts['Critical']} critical, {counts['Significant']} significant, "
+        f"{counts['Moderate']} moderate, {counts['Minor']} minor). "
+        f"{n_advocacy} advocacy target{'s' if n_advocacy != 1 else ''}. "
+        f"{n_relevance} relevance gap{'s' if n_relevance != 1 else ''}. "
+        f"{n_critiques} critique{'s' if n_critiques != 1 else ''} checked."
+    )
+    if counts["Error"]:
+        summary += f" {counts['Error']} FAILED VERIFICATION."
+    lines.append(summary + "\n")
+
+    # Section: Citation Accuracy (real errors only)
+    if accuracy_issues:
+        lines.append("#### Citation Accuracy\n")
+        for e in accuracy_issues:
+            lines.append(f"**{e['citation']}** -- {e['severity']}")
+            lines.append(f"- **Cited for**: {e['proposition']}")
+            if e['auth_file']:
+                lines.append(f"- **Authority file**: {e['auth_file']}")
+            lines.append(f"- **Assessment**: {e['explanation']}")
+            if e['quot_accurate'] is False:
+                lines.append(f"- **Quotation**: inaccurate")
+            lines.append("")
+
+    # Section: Relevance Gaps
+    if relevance_gaps:
+        lines.append("#### Relevance Gaps\n")
+        for e in relevance_gaps:
+            lines.append(f"**{e['citation']}** -- relevance: {e['relevance']}")
+            lines.append(f"- **Cited for**: {e['proposition']}")
+            if e['argument_context']:
+                lines.append(f"- **Argument**: {e['argument_context']}")
+            if e['relevance_note']:
+                lines.append(f"- **Gap**: {e['relevance_note']}")
+            if e['auth_file']:
+                lines.append(f"- **Authority file**: {e['auth_file']}")
+            lines.append("")
+
+    # Section: Advocacy Targets
+    if advocacy_targets:
+        lines.append("#### Advocacy Targets\n")
+        for e in advocacy_targets:
+            lines.append(f"**{e['citation']}** -- Advocacy")
+            lines.append(f"- **Cited for**: {e['proposition']}")
+            if e['argument_context']:
+                lines.append(f"- **Argument**: {e['argument_context']}")
+            if e['advocacy_gap']:
+                lines.append(f"- **Gap to bridge**: {e['advocacy_gap']}")
+            if e['auth_file']:
+                lines.append(f"- **Authority file**: {e['auth_file']}")
+            lines.append("")
+
+    # Section: Reply-Brief Critiques
+    if critiques:
+        lines.append("#### Reply-Brief Critiques\n")
+        for e in critiques:
+            lines.append(f"**{e['citation']}** -- {e['severity']}")
+            lines.append(f"- **Cited for**: {e['proposition']}")
+            if e['argument_context']:
+                lines.append(f"- **Argument**: {e['argument_context']}")
+            lines.append(f"- **Assessment**: {e['explanation']}")
+            if e['auth_file']:
+                lines.append(f"- **Authority file**: {e['auth_file']}")
+            lines.append("")
+
+    # Error Summary Table (accuracy errors only)
+    if accuracy_issues:
         lines.append("#### Error Summary\n")
-        lines.append("| # | Citation | Issue | Severity |")
-        lines.append("|---|----------|-------|----------|")
-        for i, (cite, issue) in enumerate(errors, 1):
-            lines.append(f"| {i} | {cite} | {issue.get('detail', '')[:60]} | {issue.get('severity', '')} |")
+        lines.append("| # | Citation | Severity | Assessment |")
+        lines.append("|---|----------|----------|------------|")
+        for i, e in enumerate(accuracy_issues, 1):
+            lines.append(f"| {i} | {e['citation']} | {e['severity']} | {e['explanation'][:80]} |")
         lines.append("")
 
     return "\n".join(lines)
@@ -495,39 +520,132 @@ def run(config: ProjectConfig):
     if not auth_txts:
         raise FileNotFoundError("No authority .txt files found. Run 'westlaw' and 'process' steps first.")
 
-    print(f"  Cite-checking {len(txt_files)} briefs against {len(auth_txts)} authorities")
-    print(f"  Parallelism: {config.parallel_agents}")
+    # Load all authority texts once
+    auth_files = {}
+    for f in sorted(auth_txts):
+        auth_files[f.name] = f.read_text(errors="replace")
 
-    tasks = []
+    print(f"  Cite-checking {len(txt_files)} briefs against {len(auth_files)} authorities")
+
+    # Classify each brief by type and party
+    brief_types = {}
     for f in txt_files:
-        tasks.append((
-            f.name,
-            f.read_text(errors="replace"),
-            str(config.authorities_dir),
-            config.claude_model,
-        ))
+        bt = classify_brief_type(f.name)
+        brief_types[f.name] = bt
+        print(f"    {f.name}: {bt['brief_type']} ({bt['party']})")
 
-    results = {}
+    # Phase A: Extract citation-proposition pairs from each brief (parallel)
+    print(f"  Phase A: Extracting citation-proposition pairs (model: {config.extraction_model})...")
+    all_pairs = {}
+
     with ProcessPoolExecutor(max_workers=config.parallel_agents) as executor:
-        futures = {
-            executor.submit(_process_one_brief, task): task[0]
-            for task in tasks
-        }
+        futures = {}
+        for f in txt_files:
+            brief_text = f.read_text(errors="replace")
+            bt = brief_types[f.name]
+            future = executor.submit(_extract_pairs, f.name, brief_text, config.extraction_model, bt)
+            futures[future] = f.name
+
         for future in as_completed(futures):
             brief_name = futures[future]
             try:
-                name, result_text = future.result()
-                results[name] = result_text
-                print(f"  Completed: {name}")
+                pairs = future.result()
+                all_pairs[brief_name] = pairs
+                print(f"    {brief_name}: {len(pairs)} citations extracted")
             except Exception as e:
-                print(f"  FAILED: {brief_name} -- {e}", file=sys.stderr)
-                results[brief_name] = f"ERROR: {e}"
+                print(f"    {brief_name}: FAILED -- {e}", file=sys.stderr)
+                all_pairs[brief_name] = []
 
+    total_pairs = sum(len(p) for p in all_pairs.values())
+    print(f"  Total citations extracted: {total_pairs}")
+
+    # Group by authority
+    print("  Grouping propositions by authority...")
+    grouped = _group_by_authority(all_pairs, auth_files)
+
+    not_found = grouped.pop(None, [])
+    if not_found:
+        print(f"  {len(not_found)} citations have no matching authority file:")
+        for prop in not_found:
+            print(f"    - {prop.get('case_name', '?')}, "
+                  f"{prop.get('volume', '')} {prop.get('reporter', '')} {prop.get('page', '')} "
+                  f"(from {prop['brief_name']})")
+
+    print(f"  {len(grouped)} authorities to verify")
+
+    # Phase B: Verify each authority with full text (parallel)
+    print(f"  Phase B: Verifying propositions against full authority texts (model: {config.verification_model})...")
+    verdicts = {}
+
+    tasks = []
+    for auth_file, props in grouped.items():
+        auth_text = auth_files[auth_file]
+        tasks.append((auth_file, auth_text, props, config.verification_model))
+
+    with ProcessPoolExecutor(max_workers=config.parallel_agents) as executor:
+        futures = {
+            executor.submit(_verify_one_authority, task): task[0]
+            for task in tasks
+        }
+        for future in as_completed(futures):
+            auth_file = futures[future]
+            try:
+                _, results = future.result()
+                verdicts[auth_file] = results
+                n_issues = sum(1 for r in results if r.get("severity") not in ("Verified", None))
+                print(f"    {auth_file}: {len(results)} propositions, {n_issues} issues")
+            except Exception as e:
+                print(f"    {auth_file}: FAILED -- {e}", file=sys.stderr)
+                verdicts[auth_file] = []
+
+    # Match verdicts back to pairs by index
+    for auth_file, props in grouped.items():
+        auth_verdicts = verdicts.get(auth_file, [])
+        if auth_verdicts:
+            for verdict in auth_verdicts:
+                idx = verdict.get("index", 0) - 1  # 1-indexed to 0-indexed
+                if 0 <= idx < len(props):
+                    props[idx]["verdict"] = verdict
+        else:
+            # Verification failed — mark all propositions for this authority
+            for prop in props:
+                prop["verdict"] = {
+                    "severity": "Error",
+                    "explanation": f"Verification failed for {auth_file} — Claude returned no results",
+                    "quotation_accurate": None,
+                }
+
+    # Mark not-found citations
+    for prop in not_found:
+        prop["verdict"] = {
+            "severity": "Critical",
+            "explanation": "No authority file found",
+            "quotation_accurate": None,
+        }
+
+    # Format report per brief
     sections = ["# Cite-Check Report\n"]
     for f in txt_files:
-        name = f.name
-        if name in results:
-            sections.append(f"\n{results[name]}\n")
+        brief_name = f.name
+        brief_pairs = []
+        for auth_file, props in grouped.items():
+            brief_pairs.extend(p for p in props if p["brief_name"] == brief_name)
+        brief_pairs.extend(p for p in not_found if p["brief_name"] == brief_name)
+
+        if brief_pairs:
+            report = _format_report(brief_name, brief_pairs)
+            sections.append(f"\n{report}\n")
 
     output_path.write_text("\n".join(sections))
     print(f"  Written: {output_path.name} ({output_path.stat().st_size:,} bytes)")
+
+    # Fail if any verifications returned no results (but skip authorities with 0 propositions)
+    failed_auths = [f for f, v in verdicts.items() if not v and grouped.get(f)]
+    if failed_auths:
+        print(f"\n  {len(failed_auths)} authorities failed verification:")
+        for f in failed_auths:
+            print(f"    - {f}")
+        raise RuntimeError(
+            f"{len(failed_auths)} authorities failed verification. "
+            f"Delete CITECHECK.md and re-run."
+        )
