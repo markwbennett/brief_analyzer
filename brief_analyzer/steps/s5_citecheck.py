@@ -81,33 +81,66 @@ def _find_authority_file(case_name: str, volume: str, reporter: str, page: str,
     """Find the matching authority file by citation components.
 
     Returns (filename, text) or None.
+    When multiple files share the same citation (companion cases),
+    uses the case name to disambiguate.
     """
-    # Try matching by volume/reporter/page in filename
     cite_pattern = f"{volume} {reporter} {page}" if reporter != "WL" else f"{page}"
 
-    for fname, text in auth_files.items():
-        if cite_pattern in fname:
-            return (fname, text)
+    # Extract name keywords for disambiguation
+    name_words = []
+    if case_name:
+        for part in case_name.replace(" v. ", " v ").split(" v "):
+            for w in part.strip().split():
+                clean = w.rstrip(".,;:").lower()
+                if len(clean) > 2 and clean not in ("state", "the", "united", "states"):
+                    name_words.append(clean)
+
+    # Collect all citation matches in filename
+    cite_matches = [(fname, text) for fname, text in auth_files.items()
+                    if cite_pattern in fname]
+
+    if cite_matches:
+        if len(cite_matches) == 1:
+            return cite_matches[0]
+        # Multiple files share this citation — disambiguate by case name
+        if name_words:
+            for fname, text in cite_matches:
+                fname_lower = fname.lower()
+                if any(w in fname_lower for w in name_words):
+                    return (fname, text)
+        # No name match; return first as fallback
+        return cite_matches[0]
 
     # Try matching by case name (first party before "v.")
     if case_name:
         first_party = case_name.split(" v.")[0].split(" v ")[0].strip()
         if first_party:
-            # Normalize for matching
             first_lower = first_party.lower().split()[-1]  # last word of first party
             for fname, text in auth_files.items():
                 if first_lower in fname.lower():
                     return (fname, text)
 
     # Try matching by citation in file content
+    content_matches = []
     for fname, text in auth_files.items():
         header = text[:2000]
         if volume and reporter and page:
             if reporter == "WL":
                 if f"WL {page}" in header:
-                    return (fname, text)
+                    content_matches.append((fname, text))
             elif f"{volume} {reporter} {page}" in header:
-                return (fname, text)
+                content_matches.append((fname, text))
+
+    if content_matches:
+        if len(content_matches) == 1:
+            return content_matches[0]
+        # Disambiguate by name
+        if name_words:
+            for fname, text in content_matches:
+                fname_lower = fname.lower()
+                if any(w in fname_lower for w in name_words):
+                    return (fname, text)
+        return content_matches[0]
 
     return None
 

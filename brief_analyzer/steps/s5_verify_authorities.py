@@ -188,9 +188,17 @@ def _match_authority(case: dict, auth_files: dict[str, str]) -> dict:
     # Strategy 1: exact volume/reporter/page in filename
     if volume and reporter and page:
         cite_str = f"{volume} {reporter} {page}"
-        for fname in auth_files:
-            if cite_str in fname:
-                return {"status": "found", "file": fname, "match_method": "cite_in_filename"}
+        cite_hits = [fname for fname in auth_files if cite_str in fname]
+        if len(cite_hits) == 1:
+            return {"status": "found", "file": cite_hits[0], "match_method": "cite_in_filename"}
+        if len(cite_hits) > 1:
+            # Multiple files share this citation (companion cases) — disambiguate by name
+            for fname in cite_hits:
+                fname_lower = fname.lower()
+                if any(n in fname_lower for n in match_names):
+                    return {"status": "found", "file": fname, "match_method": "cite_in_filename (disambiguated)"}
+            # Fallback to first match
+            return {"status": "found", "file": cite_hits[0], "match_method": "cite_in_filename"}
 
     # Strategy 2: WL number in filename
     if wl_number:
@@ -202,14 +210,24 @@ def _match_authority(case: dict, auth_files: dict[str, str]) -> dict:
     # Westlaw files often have the parallel cite far from the header
     if volume and reporter and page:
         cite_str = f"{volume} {reporter} {page}"
-        # Also try with space in "U.S." -> "U. S." (common Westlaw formatting)
         cite_variants = [cite_str]
         if "U.S." in reporter:
             cite_variants.append(cite_str.replace("U.S.", "U. S."))
+        content_hits = []
         for fname, text in auth_files.items():
             for variant in cite_variants:
                 if variant in text:
-                    return {"status": "found", "file": fname, "match_method": "cite_in_content"}
+                    content_hits.append(fname)
+                    break
+        if len(content_hits) == 1:
+            return {"status": "found", "file": content_hits[0], "match_method": "cite_in_content"}
+        if len(content_hits) > 1:
+            # Disambiguate by case name
+            for fname in content_hits:
+                fname_lower = fname.lower()
+                if any(n in fname_lower for n in match_names):
+                    return {"status": "found", "file": fname, "match_method": "cite_in_content (disambiguated)"}
+            return {"status": "found", "file": content_hits[0], "match_method": "cite_in_content"}
 
     # Strategy 4: WL cite in full file content
     if wl_year and wl_number:
