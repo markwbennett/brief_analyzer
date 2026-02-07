@@ -37,7 +37,6 @@ def run(config: ProjectConfig):
     result = run_claude(
         prompt=prompt,
         model=config.claude_model,
-        add_dirs=[config.authorities_dir],
     )
 
     output_path.write_text(result)
