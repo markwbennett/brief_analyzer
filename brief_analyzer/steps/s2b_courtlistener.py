@@ -40,7 +40,17 @@ REQUEST_DELAY = 1.1
 
 
 def run(config: ProjectConfig):
-    """Download cases from CourtListener API."""
+    """Download cases from CourtListener API.
+
+    Currently disabled -- CourtListener text quality causes false positives
+    in cite-checking. All downloads go through Westlaw instead.
+    """
+    print("  CourtListener step disabled. All citations will go to Westlaw.")
+    _write_results(config.project_dir, [], [])
+    return
+
+    # --- CourtListener download code below (disabled) ---
+
     if not config.courtlistener.api_token:
         raise ValueError(
             "CourtListener API token not set.\n"
