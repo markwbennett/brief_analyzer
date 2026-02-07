@@ -87,12 +87,42 @@ def load_config(config_path: Optional[Path] = None, **overrides) -> ProjectConfi
         or os.environ.get("COURT_LISTENER_TOKEN", "")
     )
 
+    # Westlaw credentials: YAML > env var > Doppler
+    wl_username = (
+        westlaw_data.pop("username", "")
+        or os.environ.get("WESTLAW_USERNAME", "")
+    )
+    wl_password = (
+        westlaw_data.pop("password", "")
+        or os.environ.get("WESTLAW_PASSWORD", "")
+    )
+    # Try Doppler if env vars are empty
+    if not wl_username or not wl_password:
+        try:
+            import subprocess
+            if not wl_username:
+                wl_username = subprocess.run(
+                    ["doppler", "secrets", "get", "WESTLAW_USERNAME", "--plain"],
+                    capture_output=True, text=True, timeout=5
+                ).stdout.strip()
+            if not wl_password:
+                wl_password = subprocess.run(
+                    ["doppler", "secrets", "get", "WESTLAW_PASSWORD", "--plain"],
+                    capture_output=True, text=True, timeout=5
+                ).stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
     config = ProjectConfig(
         project_dir=Path(data.get("project_dir", overrides.get("project_dir", "."))),
         case_number=data.get("case_number", overrides.get("case_number")),
         coa=data.get("coa", overrides.get("coa")),
         courtlistener=CourtListenerConfig(api_token=cl_token),
-        westlaw=WestlawConfig(**westlaw_data),
+        westlaw=WestlawConfig(
+            username=wl_username,
+            password=wl_password,
+            **westlaw_data,
+        ),
         pandoc=PandocConfig(**pandoc_data),
         claude_model=data.get("claude_model", overrides.get("model", "opus")),
         parallel_agents=data.get("parallel_agents", overrides.get("parallel", 4)),

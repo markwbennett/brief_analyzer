@@ -15,26 +15,23 @@ def run(config: ProjectConfig):
     rtf_dir = config.rtf_dir
     rtf_dir.mkdir(exist_ok=True)
 
-    # Find RTF files (both .rtf and .RTF)
-    rtfs = sorted(auth_dir.glob("*.rtf")) + sorted(auth_dir.glob("*.RTF"))
+    # Find RTF files in rtf/ subdirectory (where Westlaw downloads land)
+    rtfs = sorted(rtf_dir.glob("*.rtf")) + sorted(rtf_dir.glob("*.RTF"))
     if not rtfs:
-        # Check if text files already exist (already processed)
-        txts = list(auth_dir.glob("*.txt"))
-        if txts:
-            print(f"  No RTFs found but {len(txts)} .txt files exist. Already processed?")
-            return
-        print("  No RTF files found in authorities directory.")
+        print("  No RTF files found in authorities/rtf/. Nothing to process.")
         return
 
     print(f"  Found {len(rtfs)} RTF files to process.")
 
     converted = 0
     renamed = 0
+    skipped = 0
 
     for rtf_path in rtfs:
-        # Convert RTF to text using textutil (macOS)
-        txt_path = rtf_path.with_suffix(".txt")
-        if not txt_path.exists():
+        # Convert RTF to text using textutil (macOS).
+        # textutil writes the .txt next to the .rtf (in rtf/).
+        txt_in_rtf_dir = rtf_path.with_suffix(".txt")
+        if not txt_in_rtf_dir.exists():
             try:
                 subprocess.run(
                     ["textutil", "-convert", "txt", str(rtf_path)],
@@ -46,32 +43,35 @@ def run(config: ProjectConfig):
                 print(f"  textutil failed on {rtf_path.name}: {e.stderr.decode()}")
                 continue
 
-        if not txt_path.exists():
+        if not txt_in_rtf_dir.exists():
             print(f"  No text output for {rtf_path.name}")
             continue
 
         # Parse citation from text content
-        text = txt_path.read_text(errors="replace")
+        text = txt_in_rtf_dir.read_text(errors="replace")
         citation = parse_case_from_text(text)
 
         if citation and (citation.case_name or citation.volume):
-            new_name = citation.full_cite + ".txt"
-            new_name = sanitize_filename(new_name)
-            new_path = auth_dir / new_name
-
-            if new_path != txt_path:
-                result = safe_rename(txt_path, new_path)
-                print(f"  {rtf_path.name} -> {result.name}")
-                renamed += 1
-            else:
-                print(f"  {txt_path.name} (name already correct)")
+            new_name = sanitize_filename(citation.full_cite + ".txt")
         else:
-            print(f"  {rtf_path.name} -> {txt_path.name} (could not parse citation)")
+            # Fall back to the RTF filename
+            new_name = rtf_path.stem + ".txt"
+            print(f"  {rtf_path.name}: could not parse citation, using original name")
 
-        # Move RTF to rtf/ subdirectory
-        rtf_dest = rtf_dir / rtf_path.name
-        if not rtf_dest.exists():
-            rtf_path.rename(rtf_dest)
+        final_path = auth_dir / new_name
 
-    print(f"\n  Converted {converted} RTFs, renamed {renamed} files.")
-    print(f"  RTF originals moved to: {rtf_dir}")
+        # Skip if already exists in authorities/
+        if final_path.exists():
+            print(f"  {new_name} (already exists)")
+            skipped += 1
+            # Clean up the intermediate .txt in rtf/
+            txt_in_rtf_dir.unlink(missing_ok=True)
+            continue
+
+        # Move .txt from rtf/ up to authorities/ with the citation-based name
+        txt_in_rtf_dir.rename(final_path)
+        print(f"  {rtf_path.name} -> {final_path.name}")
+        renamed += 1
+
+    print(f"\n  Converted {converted} RTFs, renamed {renamed} files, skipped {skipped} (already exist).")
+    print(f"  RTF originals remain in: {rtf_dir}")

@@ -40,7 +40,7 @@ IMPORTANT: In the ci() search strings, use Westlaw citation format -- no spaces 
 - F.Appx (not F. App'x or F. App'x)
 The case listing above should use standard legal citation format, but the ci() search strings must use Westlaw format.
 
-If there are more than 40 citations, split into multiple ci() groups of ~40 each and label them Group 1, Group 2, etc.
+Put ALL citations in a single ci() block. Do NOT split into multiple groups -- the pipeline handles grouping later.
 
 Example: ci("845 S.W.2d 874" "328 U.S. 750" "2025 WL 3127402" "652 F.3d 557" "827 F.Supp. 372" "479 F.Appx 612")
 
