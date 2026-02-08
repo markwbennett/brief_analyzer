@@ -1,89 +1,105 @@
-# Session Notes - 2026-02-08
+# Session Notes - 2026-02-08 (Afternoon)
 
 ## Work Completed
 
-### Roberts, Shawn Reply Brief (14-25-00061-CR)
+### DOCX Line-by-Line Cite-Checker (`docx_citecheck.py`)
 
-#### 1. Added `--brief` filter to citecheck step
-- `cli.py`: new `--brief` argument (substring match on brief filename)
-- `config.py`: new `brief_filter: Optional[str]` field on `ProjectConfig`
-- `s5_citecheck.py`: `run()` filters `txt_files` when `brief_filter` is set; skips the "already exists" check so CITECHECK.md is overwritten on targeted reruns
-- Usage: `python -m brief_analyzer <dir> --step citecheck --brief "Reply"`
+Continued development of the standalone DOCX cite-checker. This session focused on report quality, verification depth, and usability.
 
-#### 2. Fixed extraction prompt to capture per-use citations
-- The extraction prompt was producing one entry per case name instead of one per citation instance
-- Added explicit instruction: "If the same case is cited multiple times for different propositions, different pin cites, or different quotations, output a SEPARATE entry for EACH use. This applies even when multiple cites appear in the same sentence or paragraph."
-- Result: Gilmore went from 1 proposition to 6; total extractions from reply brief went from 21 to 39
-- The Gilmore sign-quotation inaccuracy was caught on rerun (Moderate)
+#### 1. Report format: errors only
+- Removed all VERIFIED lines from output — report now shows only items requiring human attention
+- Renamed section to "Issues Requiring Attention"
+- Summary line still shows verified count for context
+- Trimmed existing CITECHECK_LINEBY.md from 1712 lines (216KB) to 505 lines
+- Commit: `97c8345`
 
-#### 3. Improved JSON parsing robustness
-- Extracted `_parse_json_array()` as a shared utility (replaces duplicated parsing in both `_extract_pairs` and `_verify_authority`)
-- Uses bracket-depth matching instead of greedy regex to find JSON arrays in responses with reasoning preamble
-- Added "Your response must begin with [ and end with ]" to both EXTRACT_PROMPT and VERIFY_PROMPT
+#### 2. Added `--from-json` regeneration
+- New `--from-json` flag regenerates a report from saved JSON without re-running Claude
+- Final JSON results now saved alongside markdown (`.json` file) after every run
+- `docx` positional argument made optional when `--from-json` is used
+- Commit: `97c8345`
 
-#### 4. Added diagnostic logging for verification failures
-- `_verify_authority()` now logs the specific failure mode: API error (with exit code), empty output, empty JSON array, or unparseable response (with first 200 chars)
-- Previously all failures were silently retried with no indication of cause
+#### 3. Two-pass verification for indirect case references (NEEDS_SOURCE)
+- New `NEEDS_SOURCE` status in the verification prompt
+- When Claude encounters an assertion that claims something about cases not provided (e.g., "none of the six opinions analyzes X" checked against the State's Brief), it returns NEEDS_SOURCE with full citations of the needed authorities
+- `resolve_needs_source()` parses citations from the detail text, finds them in `authorities/`, and runs a second verification pass
+- Cascading NEEDS_SOURCE entries from second-pass results are dropped
+- Prompt tightened: NEEDS_SOURCE only for assertions that claim something *about this source* but need a different source to verify — not for assertions simply unrelated to the source
+- Tested on paragraph 61: first pass flagged INACCURATE (couldn't verify "none analyzes the statutory-supremacy question" from State's Brief alone); second pass found all 6 unpublished opinions and verified all 14 assertions
+- Commit: `62b2d0d`
 
-#### 5. Generated REPLY_OUTLINE.md and PDF
-- New standalone script: `scripts/reply_outline.py`
-- Usage: `python scripts/reply_outline.py <project_dir>`
-- Uses `claude --print --model opus` with `--allowedTools Read,Bash(ls:*)` and `--add-dir` for project and authorities directories
-- Reads both briefs and selectively reads authorities to produce a detailed reply-brief argument outline with the A-E structure per issue
-- Outputs REPLY_OUTLINE.md and REPLY_OUTLINE.pdf
-- Generated 31KB outline covering both points of error with specific pin cites and quotable language
+#### 4. Page numbers via DOCX-to-PDF conversion
+- `build_page_map()`: converts DOCX → PDF via `soffice --headless`, extracts text per page with PyMuPDF (`fitz`)
+- `find_page_number()`: matches paragraph opening text against page texts to find starting page (1-based)
+- Report headings now show "Page X" instead of "Paragraph N"
+- Console output shows `p. X` during processing
+- Paragraphs spanning pages stay intact — only starting page reported
+- Added `pymupdf>=1.24` to requirements.txt
+- Commit: `33e7200`
 
-#### 6. Westlaw searches and new authority evaluation
-- Ran three Westlaw T&C searches for pat-down/magnetometer cases involving jail/prison visitors
-- Downloaded 20 cases from two search result sets (third search returned nothing)
-- Processed RTFs through rtf2text
-- Evaluated all 15 new cases; kept 8 useful ones, deleted 7 irrelevant ones
-- Cleaned up 3 bad symlinks created by rtf2text incorrectly matching new cases to AUTHORITIES.md entries
-
-#### 7. Processed manually added authorities
-- User added RTFs for Florida v. Jimeno, U.S. v. Aukai, U.S. v. Spriggs, McMorris v. Alioto
-- All converted and renamed with proper citations
-
-### Key new authorities found (not in original briefs)
-- **Gadson v. State, 668 A.2d 22 (Md. 1995)** — Maryland highest court; visitor tried to leave checkpoint, trooper refused; held detention unconstitutional absent individualized suspicion; rejected Turnbeaugh "one-way street" argument
-- **State v. Garcia, 116 N.M. 87 (N.M. Ct. App. 1993)** — visitor refused strip search; officials must escort her out, not detain; suppression when departure option not honored
-- **State v. Dane, 89 Wash.App. 226 (Wash. Ct. App. 1997)** — correctional officers had no authority to detain visitor beyond offering consent-or-leave; follows Garcia
-- **Jordan ex rel. Johnson v. Taylor, 310 F.3d 1068 (8th Cir. 2002)** — 8th Circuit; visitor encounter consensual when free to leave; no search where no coercion
-- **Neumeyer v. Beard, 421 F.3d 210 (3d Cir. 2005)** — 3d Circuit; upholds vehicle searches but fn.2 expressly reserves person-searches; consent-or-leave framework
+#### 5. Full run on Draft 4
+- Ran on `Roberts, Shawn Reply Brief Draft 4.docx`
+- 76 paragraphs, 388 assertions, 304 verified, 84 flagged
+- Completed in ~27 minutes (Opus 4.6, per-source parallel verification)
+- Output: `CITECHECK_DRAFT4.md`, `CITECHECK_DRAFT4.json`, `CITECHECK_DRAFT4.pdf`
+- PDF generated with 14pt Equity Text A, Concourse 6 headings, 1.5" margins
 
 ## Git Commits Made
-- (pending — to be committed at end of session)
+- `97c8345` — Report only flagged items, add --from-json regeneration
+- `62b2d0d` — Add two-pass verification for indirect case references
+- `33e7200` — Add page numbers via DOCX-to-PDF conversion
 
 ## Current State
-- `CITECHECK.md` in Roberts project: reply-brief-only, 39 citations, 11 accuracy issues, all verified
-- `REPLY_OUTLINE.md` and `.pdf` generated; covers both points of error
-- 108 authority .txt files in authorities/ (after adding new WL search results and deleting irrelevant ones)
-- Code changes: `--brief` filter, extraction prompt fix, JSON parsing consolidation, diagnostic logging
-- `scripts/reply_outline.py` created as standalone tool
+- `docx_citecheck.py` is feature-complete for current needs:
+  - Per-source parallel verification (Opus 4.6, no truncation)
+  - Two-pass NEEDS_SOURCE resolution
+  - Page numbers from PDF rendering
+  - Errors-only report format
+  - `--from-json` regeneration, `--dry-run`, `--start`/`--limit` for resuming
+- Latest run: Draft 4, 84 issues flagged across 36 pages
+- All outputs in `/Users/markbennett/Discovery/Roberts, Shawn Reply Brief/`
 
 ## Next Session Recommendations
-- **Regenerate REPLY_OUTLINE** with reframing: lead with the detention (seizure), not the search intrusiveness; use strip-search cases in supporting role only; incorporate Gadson, Garcia, Dane, Jordan, Neumeyer
-- **Run full 3-brief citecheck** with the fixed extraction prompt to get complete report
-- **Consider adding `--force` flag** to pipeline steps to overwrite existing output without manual deletion
-- **Consider adding a "stop on missing authorities" check** — user noted the pipeline should abort when authorities are missing rather than proceeding with wrong matches
-- **The `_parse_json_array` bracket-matching approach** should prevent most JSON-slip retries, but monitor whether opus still occasionally slips into reasoning mode on large authority texts
+- **Review the 84 flagged items** in CITECHECK_DRAFT4.pdf — many are legitimate cite-check findings (quote errors, pin cite errors, characterization issues)
+- **Some flags are false positives** — e.g., UNSUPPORTED for rhetorical characterizations ("the State's worst citation") that are argument, not factual claims. Consider adding a prompt instruction to skip pure advocacy/argument
+- **Re-run after Draft 5** with corrections applied
+- **Consider deduplication** — some paragraphs generate duplicate flags when the same assertion is checked against multiple sources (e.g., Bell and Hudson both flagged for the same "something less than probable cause" characterization)
 
 ## Quick Reference
 
-### New CLI Arguments
-- `--brief <substring>`: filter citecheck to matching brief(s) only
+### CLI Usage
+```bash
+# Full run
+python docx_citecheck.py <brief.docx> [--model opus] [--output FILE]
 
-### New/Modified Functions
-- `_parse_json_array(text, label) -> list[dict]` — `s5_citecheck.py:78` — shared JSON extraction with bracket-depth matching
-- `run(config)` in s5_citecheck.py — now respects `config.brief_filter`
+# Dry run (no Claude calls)
+python docx_citecheck.py <brief.docx> --dry-run
 
-### New Script
-- `scripts/reply_outline.py <project_dir>` — standalone reply-brief outline generator using opus with tool access
+# Resume from paragraph N
+python docx_citecheck.py <brief.docx> --start N [--limit M]
+
+# Regenerate report from saved JSON
+python docx_citecheck.py --from-json results.json [--output FILE]
+```
+
+### Key Functions
+- `build_page_map(docx_path)` → `list[str]` — DOCX→PDF→page texts
+- `find_page_number(text, page_texts)` → `int|None` — paragraph→page lookup
+- `verify_paragraph(para_num, text, sources, model, workers, page_num)` — per-source parallel verification
+- `resolve_needs_source(para_num, text, assertions, auth_files, model, workers, page_num)` — second-pass for indirect references
+- `gather_sources(paragraph, auth_files, record_index, state_brief_text, last_case)` — source collection per paragraph
+- `format_report(results)` — errors-only markdown report
 
 ### Roberts Project Files
 - Project dir: `/Users/markbennett/Discovery/Roberts, Shawn Reply Brief/`
-- Opening brief: `2025-12-29 - Brief filed - oral argument requested - Appellant.txt`
+- Draft 4: `Roberts, Shawn Reply Brief Draft 4.docx`
 - State's brief: `2026-02-05 - Brief filed - oral argument not requested - State.txt`
-- Reply draft: `Roberts, Shawn Reply Brief Draft — cited.txt`
-- Authorities: `authorities/` (108 .txt files)
-- Outputs: `CITECHECK.md`, `REPLY_OUTLINE.md`, `REPLY_OUTLINE.pdf`, `AUTHORITIES.md`
+- Authorities: `authorities/` (98 .txt files)
+- Latest outputs: `CITECHECK_DRAFT4.md`, `.json`, `.pdf`
+
+### PDF Generation
+```bash
+pandoc --pdf-engine=xelatex -V geometry:margin=1.5in -V documentclass=extarticle \
+  -V fontsize=14pt -V mainfont="Equity Text A" -V sansfont="Concourse 6" \
+  -o output.pdf input.md
+```
