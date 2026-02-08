@@ -1,5 +1,25 @@
 # Progress Log
 
+## 2026-02-08 (evening) — DOCX cite-checker: page segmentation, Draft 6 verification
+
+### What was done
+- Ran `docx_citecheck.py` on Roberts Reply Brief Draft 6: 75 paragraphs, 349 assertions, 286 verified, 63 flagged
+- Extensive review of cite-check results against the brief with the user, identifying must-fix items vs. judgment calls
+- User made substantive edits to Draft 6 during session: detention/seizure framing, Cates paragraph, Aukai paragraph, bouncer→security guard, multiple pin cite corrections, Spear/warrant fix
+- Added `segment_by_pages()` to `docx_citecheck.py` — converts inline Westlaw `*NNN` page markers to explicit `[PAGE NNN]` headers before sending source text to Claude
+- Updated VERIFY_PROMPT instruction 5 to explain page headers and pin cite verification rules
+- Re-ran cite-checker with page segmentation: 300 assertions, 245 verified, 55 flagged (down from 63)
+- New pin cite errors caught by segmentation: James 318→317–18, James 315→314, Cates 982→982–83
+- Commit: `9e4758f` (page segmentation feature)
+
+### Why
+- The cite-checker was missing pin cite errors because Claude had to parse inline `*NNN` markers interleaved across long authority texts — ambiguous especially when multiple reporters share the same document
+- Converting to `[PAGE NNN]` headers gives unambiguous page boundaries, allowing the model to verify pin cites against actual page content
+
+### Alternatives considered
+- Pre-splitting authority text into per-page chunks (rejected — would lose cross-page context for quotes spanning page boundaries)
+- Post-processing pin cites separately from content verification (rejected — pin cite accuracy depends on understanding what content is being cited)
+
 ## 2026-02-08 — Roberts reply brief: citecheck improvements, reply outline, Westlaw research
 
 ### What was done
