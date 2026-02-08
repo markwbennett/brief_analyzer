@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import docx
+import fitz  # PyMuPDF
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +345,7 @@ IMPORTANT rules for NEEDS_SOURCE:
 
 Output ONLY the JSON array. No commentary, no markdown fencing. Begin with [ and end with ].
 
-## Paragraph from the brief (paragraph {para_num}):
+## Paragraph from the brief ({location}):
 
 {paragraph}
 
@@ -396,7 +397,8 @@ def _call_claude(prompt: str, model: str, label: str, max_retries: int = 3) -> l
 
 
 def verify_paragraph(para_num: int, paragraph: str, sources: list[tuple[str, str]],
-                     model: str = "opus", workers: int = 4) -> list[dict]:
+                     model: str = "opus", workers: int = 4,
+                     page_num: int | None = None) -> list[dict]:
     """Verify a paragraph against each source in parallel (one prompt per source).
 
     sources: list of (label, source_text) — e.g. ("Bell v. Wolfish, 441 U.S. 520", full_text)
@@ -405,13 +407,14 @@ def verify_paragraph(para_num: int, paragraph: str, sources: list[tuple[str, str
     if not sources:
         return []
 
+    location = f"page {page_num}" if page_num else f"paragraph {para_num}"
     all_assertions = []
 
     # Build prompts
     tasks = []
     for label, source_text in sources:
         prompt = VERIFY_PROMPT.format(
-            para_num=para_num,
+            location=location,
             paragraph=paragraph,
             source=f"=== {label} ===\n{source_text}",
         )
@@ -437,7 +440,7 @@ def verify_paragraph(para_num: int, paragraph: str, sources: list[tuple[str, str
 
 def resolve_needs_source(para_num: int, paragraph: str, assertions: list[dict],
                          auth_files: dict[str, str], model: str = "opus",
-                         workers: int = 4) -> list[dict]:
+                         workers: int = 4, page_num: int | None = None) -> list[dict]:
     """Second pass: resolve NEEDS_SOURCE assertions by finding the named authorities.
 
     Parses case names/citations from the NEEDS_SOURCE detail field, looks them
@@ -478,7 +481,8 @@ def resolve_needs_source(para_num: int, paragraph: str, assertions: list[dict],
     # Run verification against the new sources
     source_tuples = [(fname, text) for fname, text in extra_sources]
     new_assertions = verify_paragraph(para_num, paragraph, source_tuples,
-                                      model=model, workers=workers)
+                                      model=model, workers=workers,
+                                      page_num=page_num)
 
     # Replace NEEDS_SOURCE entries with the new results (drop any cascading NEEDS_SOURCE)
     kept = [a for a in assertions if a.get("status") != "NEEDS_SOURCE"]
@@ -600,6 +604,68 @@ def extract_paragraphs(docx_path: Path) -> list[tuple[int, str]]:
     return paragraphs
 
 
+def build_page_map(docx_path: Path) -> list[str]:
+    """Convert DOCX to PDF via LibreOffice and extract text per page.
+
+    Returns a list of page texts, indexed by page number (0-based).
+    """
+    import tempfile
+    import shutil
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Convert DOCX → PDF
+        result = subprocess.run(
+            ["soffice", "--headless", "--convert-to", "pdf",
+             "--outdir", tmpdir, str(docx_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        pdf_name = docx_path.stem + ".pdf"
+        pdf_path = Path(tmpdir) / pdf_name
+        if not pdf_path.exists():
+            print(f"  Warning: PDF conversion failed: {result.stderr.strip()[:200]}", file=sys.stderr)
+            return []
+
+        # Extract text per page
+        doc = fitz.open(str(pdf_path))
+        pages = []
+        for page in doc:
+            pages.append(page.get_text())
+        doc.close()
+        return pages
+
+
+def find_page_number(paragraph_text: str, page_texts: list[str]) -> int | None:
+    """Find which page a paragraph starts on by matching its opening text.
+
+    Returns 1-based page number, or None if not found.
+    """
+    if not page_texts:
+        return None
+
+    # Normalize whitespace for matching
+    def normalize(s: str) -> str:
+        return re.sub(r'\s+', ' ', s.strip())
+
+    # Use the first 80 chars of the paragraph as search key
+    # (enough to be unique, short enough to avoid line-break mismatches)
+    norm_para = normalize(paragraph_text)
+    snippet = norm_para[:80]
+    if len(snippet) < 15:
+        snippet = norm_para  # very short paragraph — use it all
+
+    for i, page_text in enumerate(page_texts):
+        if snippet in normalize(page_text):
+            return i + 1  # 1-based page number
+
+    # Fallback: try shorter prefix (page breaks can split words)
+    snippet = norm_para[:40]
+    for i, page_text in enumerate(page_texts):
+        if snippet in normalize(page_text):
+            return i + 1
+
+    return None
+
+
 def is_body_paragraph(text: str) -> bool:
     """Determine if a paragraph is part of the brief's body (not TOC, index, etc.)."""
     # Skip very short lines that are likely headers/section markers
@@ -659,9 +725,11 @@ def format_report(results: list[dict]) -> str:
         if not para_errors:
             continue
 
+        page = r.get("page")
         para_num = r["para_num"]
+        heading = f"Page {page}" if page else f"Paragraph {para_num}"
         preview = r["text"][:200] + ("..." if len(r["text"]) > 200 else "")
-        lines.append(f"### Paragraph {para_num}")
+        lines.append(f"### {heading}")
         lines.append(f"> {preview}\n")
 
         for a in para_errors:
@@ -764,6 +832,14 @@ def main():
     paragraphs = extract_paragraphs(docx_path)
     print(f"Extracted {len(paragraphs)} non-empty paragraphs")
 
+    # Build page map (DOCX → PDF → page texts)
+    print("Converting to PDF for page mapping...")
+    page_texts = build_page_map(docx_path)
+    if page_texts:
+        print(f"Page map: {len(page_texts)} pages")
+    else:
+        print("  Warning: page mapping unavailable, using paragraph numbers")
+
     # Filter to body paragraphs with citations
     # Skip front matter (TOC, index of authorities) — look for "Argument" or "Summary"
     body_start = 0
@@ -836,7 +912,9 @@ def main():
             break
 
         elapsed = time.time() - start_time
-        print(f"\n[{seq+1}/{len(cite_paragraphs)}] Para {para_idx} ({elapsed:.0f}s elapsed)")
+        page_num = find_page_number(text, page_texts)
+        loc = f"p. {page_num}" if page_num else f"para {para_idx}"
+        print(f"\n[{seq+1}/{len(cite_paragraphs)}] {loc} ({elapsed:.0f}s elapsed)")
         print(f"  {text[:100]}...")
 
         # Gather sources (list of (label, text) tuples — one per source)
@@ -848,11 +926,12 @@ def main():
         print(f"  Sources ({len(sources)}): {', '.join(source_labels)} [{total_kb:.0f} KB total]")
 
         # Call Claude — one prompt per source, in parallel
-        assertions = verify_paragraph(para_idx, text, sources, model=args.model)
+        assertions = verify_paragraph(para_idx, text, sources, model=args.model,
+                                      page_num=page_num)
 
         # Second pass: resolve any NEEDS_SOURCE assertions
         assertions = resolve_needs_source(para_idx, text, assertions, auth_files,
-                                          model=args.model)
+                                          model=args.model, page_num=page_num)
 
         n_verified = sum(1 for a in assertions if a.get("status") == "VERIFIED")
         n_errors = sum(1 for a in assertions if a.get("status") in
@@ -865,6 +944,7 @@ def main():
 
         results.append({
             "para_num": para_idx,
+            "page": page_num,
             "text": text,
             "assertions": assertions,
         })
