@@ -335,6 +335,12 @@ Status meanings:
 - QUOTE_ERROR: A quotation is not verbatim (beyond ellipses/brackets).
 - PIN_CITE_ERROR: The pin cite page doesn't contain the referenced material.
 - UNSUPPORTED: The source doesn't address the proposition at all.
+- NEEDS_SOURCE: The assertion makes a SPECIFIC CLAIM ABOUT THIS SOURCE that can only be verified by reading a different source not provided here. In "detail", name the specific case(s) or source(s) needed using full citations (e.g. "Must check against Haywood v. State, 2014 WL 7131176").
+
+IMPORTANT rules for NEEDS_SOURCE:
+- ONLY use it when the assertion directly claims something about THIS source (e.g., "none of the six opinions analyzes X" checked against the State's Brief — the six opinions are the needed sources).
+- Do NOT use NEEDS_SOURCE for assertions that simply aren't about this source. If an assertion is about a different case, statute, or rule, SKIP it entirely — it is not your job to check it.
+- Do NOT flag statutory text or legal propositions as NEEDS_SOURCE. Only flag when the paragraph attributes a specific factual claim to authorities you haven't been given.
 
 Output ONLY the JSON array. No commentary, no markdown fencing. Begin with [ and end with ].
 
@@ -427,6 +433,57 @@ def verify_paragraph(para_num: int, paragraph: str, sources: list[tuple[str, str
                 print(f"    Para {para_num}/{label}: FAILED — {e}", file=sys.stderr)
 
     return all_assertions
+
+
+def resolve_needs_source(para_num: int, paragraph: str, assertions: list[dict],
+                         auth_files: dict[str, str], model: str = "opus",
+                         workers: int = 4) -> list[dict]:
+    """Second pass: resolve NEEDS_SOURCE assertions by finding the named authorities.
+
+    Parses case names/citations from the NEEDS_SOURCE detail field, looks them
+    up in auth_files, and runs verification prompts against each found source.
+    Replaces NEEDS_SOURCE entries with the new results.
+    """
+    needs = [a for a in assertions if a.get("status") == "NEEDS_SOURCE"]
+    if not needs:
+        return assertions
+
+    # Collect all sources mentioned across NEEDS_SOURCE entries
+    extra_sources = []
+    seen_fnames = set()
+    for a in needs:
+        detail = a.get("detail", "")
+        # Extract WL citations from the detail text
+        for m in WL_CITE_RE.finditer(detail):
+            wl = m.group(0)
+            match = find_authority("", "", "WL", wl.split("WL")[1].strip(), auth_files)
+            if match and match[0] not in seen_fnames:
+                seen_fnames.add(match[0])
+                extra_sources.append(match)
+        # Extract full case citations from the detail text
+        for m in CASE_CITE_RE.finditer(detail):
+            name, vol, rep, pg = m.group(1).strip(), m.group(2), m.group(3), m.group(4)
+            match = find_authority(name, vol, rep, pg, auth_files)
+            if match and match[0] not in seen_fnames:
+                seen_fnames.add(match[0])
+                extra_sources.append(match)
+
+    if not extra_sources:
+        return assertions
+
+    print(f"  Second pass: {len(extra_sources)} additional source(s) for NEEDS_SOURCE")
+    for fname, _ in extra_sources:
+        print(f"    + {fname[:60]}")
+
+    # Run verification against the new sources
+    source_tuples = [(fname, text) for fname, text in extra_sources]
+    new_assertions = verify_paragraph(para_num, paragraph, source_tuples,
+                                      model=model, workers=workers)
+
+    # Replace NEEDS_SOURCE entries with the new results (drop any cascading NEEDS_SOURCE)
+    kept = [a for a in assertions if a.get("status") != "NEEDS_SOURCE"]
+    kept.extend(a for a in new_assertions if a.get("status") != "NEEDS_SOURCE")
+    return kept
 
 
 def parse_json_array(text: str, label: str = "") -> list[dict]:
@@ -583,7 +640,7 @@ def format_report(results: list[dict]) -> str:
                 verified += 1
             elif status == "NOT_CHECKED":
                 not_checked += 1
-            elif status in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED"):
+            elif status in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED", "NEEDS_SOURCE"):
                 errors += 1
 
     lines.append(f"**Summary**: {len(results)} paragraphs checked, "
@@ -598,7 +655,7 @@ def format_report(results: list[dict]) -> str:
     lines.append("## Issues Requiring Attention\n")
     for r in results:
         para_errors = [a for a in r.get("assertions", [])
-                       if a.get("status") in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED")]
+                       if a.get("status") in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED", "NEEDS_SOURCE")]
         if not para_errors:
             continue
 
@@ -792,6 +849,11 @@ def main():
 
         # Call Claude — one prompt per source, in parallel
         assertions = verify_paragraph(para_idx, text, sources, model=args.model)
+
+        # Second pass: resolve any NEEDS_SOURCE assertions
+        assertions = resolve_needs_source(para_idx, text, assertions, auth_files,
+                                          model=args.model)
+
         n_verified = sum(1 for a in assertions if a.get("status") == "VERIFIED")
         n_errors = sum(1 for a in assertions if a.get("status") in
                        ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED"))
@@ -833,7 +895,7 @@ def main():
     error_count = 0
     for r in results:
         for a in r.get("assertions", []):
-            if a.get("status") in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED"):
+            if a.get("status") in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED", "NEEDS_SOURCE"):
                 error_count += 1
 
     if error_count:
