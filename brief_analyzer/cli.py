@@ -49,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Claude model to use (default: opus)",
     )
     parser.add_argument(
+        "--brief",
+        help="Substring filter to cite-check only matching brief(s) (e.g., 'Reply')",
+    )
+    parser.add_argument(
         "--config",
         type=Path,
         help="Path to brief_config.yaml",
@@ -73,6 +77,7 @@ def parse_args(argv: Optional[list[str]] = None) -> tuple[ProjectConfig, argpars
         coa=args.coa,
         model=args.model,
         parallel=args.parallel,
+        brief_filter=getattr(args, "brief", None),
     )
 
     return config, args

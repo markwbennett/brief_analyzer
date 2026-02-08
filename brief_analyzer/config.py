@@ -42,6 +42,7 @@ class ProjectConfig:
     extraction_model: str = "haiku"
     verification_model: str = "opus"
     parallel_agents: int = 4
+    brief_filter: Optional[str] = None
 
     @property
     def authorities_dir(self) -> Path:
@@ -140,5 +141,9 @@ def load_config(config_path: Optional[Path] = None, **overrides) -> ProjectConfi
                 config.parallel_agents = val
             else:
                 setattr(config, key, val)
+
+    bf = overrides.get("brief_filter")
+    if bf:
+        config.brief_filter = bf
 
     return config

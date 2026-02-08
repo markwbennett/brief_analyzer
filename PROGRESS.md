@@ -1,5 +1,24 @@
 # Progress Log
 
+## 2026-02-08 — Roberts reply brief: citecheck improvements, reply outline, Westlaw research
+
+### What was done
+- Added `--brief` filter to citecheck step for targeted single-brief reruns
+- Fixed extraction prompt: now captures per-use citations (not per-case), catching quotation inaccuracies like the Gilmore sign quote
+- Consolidated JSON parsing into `_parse_json_array()` with bracket-depth matching; added "begin with [" prompt instruction to reduce model reasoning-slip
+- Added diagnostic logging for verification failures (API error vs empty output vs parse failure)
+- Created `scripts/reply_outline.py`: standalone tool that generates a reply-brief argument outline using opus with tool access
+- Ran targeted Westlaw searches for pat-down/magnetometer visitor cases; found Gadson, Garcia, Dane, Jordan, Neumeyer as new authorities supporting the right-to-leave argument at lower intrusiveness levels
+
+### Why
+- The extraction prompt was collapsing multiple uses of the same case into one entry, missing quotation errors
+- Verification failures were silent, making debugging impossible
+- The Roberts reply brief needed a fresh outline grounded in the actual authorities
+- The existing reply brief draft relied too heavily on strip-search authority; needed pat-down-level cases
+
+### Alternatives considered
+- Anthropic SDK with assistant prefill for JSON-only output: would be more reliable than prompt instructions, but requires switching from `claude --print` (which uses the access token for subscription billing) to the SDK (which needs API key auth). Deferred.
+
 ## 2025-02-06 — Pipeline fixes and first full run
 
 ### What was done

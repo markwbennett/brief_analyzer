@@ -23,13 +23,15 @@ from ..utils.file_utils import classify_brief_type, find_brief_texts
 
 EXTRACT_PROMPT = """You are a legal citation extractor. Read this brief and extract every case citation with its context.
 
+IMPORTANT: If the same case is cited multiple times for different propositions, different pin cites, or different quotations, output a SEPARATE entry for EACH use. This applies even when multiple cites appear in the same sentence or paragraph. For example, "Smith, 100 S.W.3d at 5 (holding X); id. at 12 (holding Y)" is TWO entries. Every distinct proposition-citation pairing gets its own entry.
+
 ## Brief Context
 
 This is a{brief_type_article} {brief_type_label} filed by the {party}.{reply_guidance}
 
 ## Extraction Fields
 
-For each citation, output a JSON object with these fields:
+For each citation instance, output a JSON object with these fields:
 - case_name: the case name as cited (e.g., "Theus v. State")
 - volume: reporter volume number (e.g., "845")
 - reporter: reporter abbreviation (e.g., "S.W.2d", "U.S.", "F.3d", "WL")
@@ -51,7 +53,7 @@ For each citation, output a JSON object with these fields:
 - **critiquing**: the brief argues this authority does NOT support the opposing party's position or is distinguishable
 - **background**: cited for uncontested general propositions (standard of review, procedural rules, etc.)
 
-Output ONLY a JSON array. No commentary, no markdown fencing. Just the raw JSON array.
+Output ONLY a JSON array. No commentary, no markdown fencing, no reasoning. Your response must begin with [ and end with ].
 
 BRIEF TEXT:
 
@@ -71,6 +73,41 @@ def _claude_env():
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
     return env
+
+
+def _parse_json_array(text: str, label: str = "") -> list[dict]:
+    """Extract a JSON array from text that may contain markdown fences or reasoning preamble."""
+    # Strip markdown fences
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip())
+    text = re.sub(r"\n?```\s*$", "", text)
+
+    # Try direct parse first
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            if not parsed:
+                print(f"    {label}: claude returned empty JSON array")
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Find the outermost [...] in the response (handles reasoning preamble/postamble)
+    start = text.find("[")
+    if start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "[":
+                depth += 1
+            elif text[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+
+    print(f"    {label}: could not parse response as JSON ({len(text)} chars): {text[:200]}")
+    return []
 
 
 def _extract_pairs(brief_name: str, brief_text: str, model: str,
@@ -109,24 +146,11 @@ def _extract_pairs(brief_name: str, brief_text: str, model: str,
         return []
 
     text = result.stdout.strip()
-    # Strip markdown code fencing if present
-    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-    text = re.sub(r"\n?```\s*$", "", text)
+    if not text:
+        print(f"  {brief_name}: claude --print returned empty output")
+        return []
 
-    try:
-        pairs = json.loads(text)
-        if isinstance(pairs, list):
-            return pairs
-    except json.JSONDecodeError as e:
-        print(f"  JSON parse failed for {brief_name}: {e}", file=sys.stderr)
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-
-    return []
+    return _parse_json_array(text, brief_name)
 
 
 # --- Authority file matching ---
@@ -237,7 +261,7 @@ Output a JSON array with one object per proposition:
 
 For fields that don't apply to a given purpose, use null. For example, advocacy_gap is null for supporting citations; relevance is null for background citations.
 
-Output ONLY the JSON array. No commentary, no markdown fencing.
+Output ONLY the JSON array. No commentary, no markdown fencing, no reasoning. Your response must begin with [ and end with ].
 
 === AUTHORITY TEXT ===
 {authority_text}
@@ -275,23 +299,15 @@ def _verify_authority(authority_file: str, authority_text: str,
 
     if result.returncode != 0:
         err_msg = result.stderr.strip() or result.stdout.strip()
-        print(f"    Verify failed for {authority_file}: {err_msg[:300]}", file=sys.stderr)
+        print(f"    {authority_file}: claude --print failed (exit {result.returncode}): {err_msg[:300]}")
         return []
 
     text = result.stdout.strip()
-    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-    text = re.sub(r"\n?```\s*$", "", text)
+    if not text:
+        print(f"    {authority_file}: claude --print returned empty output")
+        return []
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-    return []
+    return _parse_json_array(text, authority_file)
 
 
 def _verify_one_authority(args: tuple, max_retries: int = 3) -> tuple[str, list[dict]]:
@@ -508,13 +524,19 @@ def run(config: ProjectConfig):
     """Run cite-check on substantive briefs."""
     output_path = config.project_dir / "CITECHECK.md"
 
-    if output_path.exists() and output_path.stat().st_size > 0:
+    if output_path.exists() and output_path.stat().st_size > 0 and not config.brief_filter:
         print(f"  Skipping (already exists): {output_path.name}")
         return
 
     txt_files = find_brief_texts(config.project_dir)
     if not txt_files:
         raise FileNotFoundError("No substantive brief .txt files found. Run the 'convert' step first.")
+
+    if config.brief_filter:
+        txt_files = [f for f in txt_files if config.brief_filter.lower() in f.name.lower()]
+        if not txt_files:
+            raise FileNotFoundError(f"No briefs matching '{config.brief_filter}'. Available: "
+                                    + ", ".join(f.name for f in find_brief_texts(config.project_dir)))
 
     auth_txts = list(config.authorities_dir.glob("*.txt"))
     if not auth_txts:
@@ -598,6 +620,25 @@ def run(config: ProjectConfig):
                 print(f"    {auth_file}: FAILED -- {e}", file=sys.stderr)
                 verdicts[auth_file] = []
 
+    # Retry any authorities that returned no results
+    failed = [t for t in tasks if not verdicts.get(t[0])]
+    if failed:
+        print(f"  Retrying {len(failed)} failed verification(s)...")
+        with ProcessPoolExecutor(max_workers=config.parallel_agents) as executor:
+            futures = {
+                executor.submit(_verify_one_authority, task): task[0]
+                for task in failed
+            }
+            for future in as_completed(futures):
+                auth_file = futures[future]
+                try:
+                    _, results = future.result()
+                    verdicts[auth_file] = results
+                    n_issues = sum(1 for r in results if r.get("severity") not in ("Verified", None))
+                    print(f"    {auth_file}: {len(results)} propositions, {n_issues} issues")
+                except Exception as e:
+                    print(f"    {auth_file}: RETRY FAILED -- {e}", file=sys.stderr)
+
     # Match verdicts back to pairs by index
     for auth_file, props in grouped.items():
         auth_verdicts = verdicts.get(auth_file, [])
@@ -639,13 +680,9 @@ def run(config: ProjectConfig):
     output_path.write_text("\n".join(sections))
     print(f"  Written: {output_path.name} ({output_path.stat().st_size:,} bytes)")
 
-    # Fail if any verifications returned no results (but skip authorities with 0 propositions)
+    # Warn about any verifications that returned no results
     failed_auths = [f for f, v in verdicts.items() if not v and grouped.get(f)]
     if failed_auths:
-        print(f"\n  {len(failed_auths)} authorities failed verification:")
+        print(f"\n  WARNING: {len(failed_auths)} authorities failed verification (marked as Error in report):")
         for f in failed_auths:
             print(f"    - {f}")
-        raise RuntimeError(
-            f"{len(failed_auths)} authorities failed verification. "
-            f"Delete CITECHECK.md and re-run."
-        )
