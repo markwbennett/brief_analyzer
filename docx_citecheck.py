@@ -566,7 +566,7 @@ def is_body_paragraph(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def format_report(results: list[dict]) -> str:
-    """Format all results into a markdown report."""
+    """Format results into a markdown report showing only items needing human attention."""
     lines = ["# Line-by-Line Cite-Check Report\n"]
 
     # Count totals
@@ -588,70 +588,30 @@ def format_report(results: list[dict]) -> str:
 
     lines.append(f"**Summary**: {len(results)} paragraphs checked, "
                  f"{total_assertions} assertions found. "
-                 f"{verified} verified, {errors} errors, {not_checked} not checked.\n")
+                 f"{verified} verified, {errors} flagged for review.\n")
 
-    # Errors section first
-    error_entries = []
+    if errors == 0:
+        lines.append("No issues found. All assertions verified.\n")
+        return "\n".join(lines)
+
+    # Group errors by paragraph
+    lines.append("## Issues Requiring Attention\n")
     for r in results:
-        for a in r.get("assertions", []):
-            if a.get("status") in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED"):
-                error_entries.append((r["para_num"], r["text"][:100], a))
-
-    if error_entries:
-        lines.append("## Errors and Issues\n")
-        for para_num, para_preview, a in error_entries:
-            lines.append(f"### Paragraph {para_num}")
-            lines.append(f"> {para_preview}...")
-            lines.append(f"- **Status**: {a['status']}")
-            lines.append(f"- **Assertion**: {a['assertion']}")
-            lines.append(f"- **Source**: {a['source']}")
-            lines.append(f"- **Detail**: {a['detail']}")
-            lines.append("")
-
-    # Full paragraph-by-paragraph results
-    lines.append("## Paragraph-by-Paragraph Results\n")
-    for r in results:
-        para_num = r["para_num"]
-        text = r["text"]
-        assertions = r.get("assertions", [])
-
-        # Determine overall status for this paragraph
-        statuses = [a.get("status", "") for a in assertions]
-        has_error = any(s in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED") for s in statuses)
-        all_verified = all(s == "VERIFIED" for s in statuses) if statuses else False
-
-        if has_error:
-            marker = "ISSUE"
-        elif all_verified:
-            marker = "OK"
-        else:
-            marker = "PARTIAL"
-
-        lines.append(f"### [{marker}] Paragraph {para_num}")
-        # Show first 200 chars of paragraph
-        preview = text[:200] + ("..." if len(text) > 200 else "")
-        lines.append(f"> {preview}\n")
-
-        if not assertions:
-            lines.append("*No verifiable assertions returned.*\n")
+        para_errors = [a for a in r.get("assertions", [])
+                       if a.get("status") in ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED")]
+        if not para_errors:
             continue
 
-        for a in assertions:
-            status = a.get("status", "?")
-            icon = {
-                "VERIFIED": "PASS",
-                "INACCURATE": "FAIL",
-                "QUOTE_ERROR": "FAIL",
-                "PIN_CITE_ERROR": "FAIL",
-                "UNSUPPORTED": "FAIL",
-                "NOT_CHECKED": "SKIP",
-            }.get(status, "?")
+        para_num = r["para_num"]
+        preview = r["text"][:200] + ("..." if len(r["text"]) > 200 else "")
+        lines.append(f"### Paragraph {para_num}")
+        lines.append(f"> {preview}\n")
 
-            lines.append(f"- **[{icon}]** {a.get('assertion', '')}")
+        for a in para_errors:
+            lines.append(f"- **{a.get('status', '?')}**: {a.get('assertion', '')}")
             lines.append(f"  - Source: {a.get('source', '?')}")
-            lines.append(f"  - Status: {status}")
             if a.get("detail"):
-                lines.append(f"  - Detail: {a['detail']}")
+                lines.append(f"  - {a['detail']}")
 
         lines.append("")
 
@@ -664,7 +624,7 @@ def format_report(results: list[dict]) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Line-by-line DOCX brief cite-checker")
-    parser.add_argument("docx", type=Path, help="Path to the .docx brief")
+    parser.add_argument("docx", type=Path, nargs="?", help="Path to the .docx brief")
     parser.add_argument("--output", "-o", type=Path, default=None,
                         help="Output markdown file (default: CITECHECK_LINEBY.md in same dir)")
     parser.add_argument("--model", default="opus",
@@ -675,7 +635,26 @@ def main():
                         help="Process only this many paragraphs (0 = all)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show which paragraphs would be checked, without calling Claude")
+    parser.add_argument("--from-json", type=Path, default=None,
+                        help="Regenerate report from a saved JSON results file (no Claude calls)")
     args = parser.parse_args()
+
+    if not args.from_json and not args.docx:
+        parser.error("docx path is required unless --from-json is used")
+
+    # Regenerate report from saved JSON
+    if args.from_json:
+        json_path = args.from_json.resolve()
+        if not json_path.exists():
+            print(f"File not found: {json_path}", file=sys.stderr)
+            sys.exit(1)
+        results = json.loads(json_path.read_text())
+        output_path = args.output or json_path.with_name("CITECHECK_LINEBY.md")
+        report = format_report(results)
+        report += f"\n---\n*Regenerated from {json_path.name}*\n"
+        output_path.write_text(report)
+        print(f"Report regenerated: {output_path}")
+        return
 
     docx_path = args.docx.resolve()
     if not docx_path.exists():
@@ -840,6 +819,11 @@ def main():
     output_path.write_text(report)
     print(f"\nReport written to: {output_path}")
     print(f"Total time: {total_time:.0f}s")
+
+    # Save final JSON results (for --from-json regeneration)
+    json_path = output_path.with_suffix(".json")
+    json_path.write_text(json.dumps(results, indent=2))
+    print(f"JSON results saved to: {json_path}")
 
     # Clean up partial file
     if partial_path.exists():
