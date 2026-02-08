@@ -126,6 +126,16 @@ def has_citation(text: str) -> bool:
 # Authority file matching
 # ---------------------------------------------------------------------------
 
+def segment_by_pages(text: str) -> str:
+    """Replace inline *NNN page markers with clear [PAGE NNN] headers.
+
+    Westlaw opinion texts embed page markers as *NNN inline in the text.
+    This converts them to explicit headers so the model can easily determine
+    which page a passage falls on for pin cite verification.
+    """
+    return re.sub(r'\*(\d{2,})(?=\s|$)', r'\n\n[PAGE \1]\n', text)
+
+
 def load_authorities(auth_dir: Path) -> dict[str, str]:
     """Load all .txt authority files into {filename: text}."""
     files = {}
@@ -311,7 +321,7 @@ Check every assertion in this paragraph that relates to the source provided. Spe
 
 4. **State's Brief assertions**: When the brief describes what "the State argues" or quotes the State's Brief, verify accuracy against the State's Brief text.
 
-5. **Pin cites**: Verify that pin-cite page numbers correspond to the actual location of the quoted or cited material in the source.
+5. **Pin cites**: Verify that pin-cite page numbers correspond to the actual location of the quoted or cited material in the source. The source text contains [PAGE NNN] headers marking where each reporter page begins. Use these headers to determine which page a passage falls on. A passage is on page NNN if it appears after [PAGE NNN] and before the next [PAGE] header. If a pin cite says "at 982–83" but the material falls entirely after [PAGE 982] and before [PAGE 983], the correct cite is just 982, not 982–83.
 
 Only check assertions that relate to THIS source. Skip assertions about other sources.
 
@@ -416,7 +426,7 @@ def verify_paragraph(para_num: int, paragraph: str, sources: list[tuple[str, str
         prompt = VERIFY_PROMPT.format(
             location=location,
             paragraph=paragraph,
-            source=f"=== {label} ===\n{source_text}",
+            source=f"=== {label} ===\n{segment_by_pages(source_text)}",
         )
         tasks.append((prompt, label))
 
