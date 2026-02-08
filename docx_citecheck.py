@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import docx
@@ -77,8 +78,18 @@ RR_CITE_RE = re.compile(r'RR(\d+):(\d+)')
 # Clerk's Record: CR:{page} or CR at {page}
 CR_CITE_RE = re.compile(r'CR(?:\s*(?:at\s+))?:?\s*(\d+)')
 
-# State's Brief reference (handle curly apostrophe U+2019 and straight)
+# State's Brief explicit page reference (handle curly apostrophe U+2019 and straight)
 STATE_BRIEF_RE = re.compile(r"State[\u2019']s\s+Br(?:ief|\.)\s+(?:at\s+)?(\d+(?:\s*[-\u2013]\s*\d+)?)", re.IGNORECASE)
+
+# Broader State's Brief reference — "The State argues/cites/concedes/claims..." or "State's argument/position"
+STATE_ARGUES_RE = re.compile(
+    r"(?:"
+    r"(?:The\s+)?State\s+(?:argu|cit|conced|claim|acknowledg|assert|content|maintain|reli)"  # "The State argues"
+    r"|State[\u2019']s\s+(?:\w+\s+){0,3}(?:argu|cit|position|response|brief|claim|content)"  # "State's [adj] argument"
+    r"|State[\u2019']s\s+Br"  # "State's Br."
+    r")",
+    re.IGNORECASE
+)
 
 # Exhibit reference: SX{num} {timestamp}
 EXHIBIT_RE = re.compile(r'SX(\d+)\s+([\d:]+(?:\s*[-\u2013]\s*[\d:]+)?)')
@@ -104,6 +115,7 @@ def has_citation(text: str) -> bool:
         or RR_CITE_RE.search(t)
         or CR_CITE_RE.search(t)
         or STATE_BRIEF_RE.search(t)
+        or STATE_ARGUES_RE.search(t)
         or EXHIBIT_RE.search(t)
         or ID_CITE_RE.search(t)
     )
@@ -284,13 +296,13 @@ def get_record_page(record_index: dict, vol_type: str, vol_num: int, page: int) 
 # Claude verification
 # ---------------------------------------------------------------------------
 
-VERIFY_PROMPT = """You are a meticulous legal cite-checker. You are checking a single paragraph from an appellate reply brief.
+VERIFY_PROMPT = """You are a meticulous legal cite-checker. You are checking a single paragraph from an appellate reply brief against ONE source.
 
 ## Your task
 
-Check every assertion in this paragraph against the source material provided. Specifically:
+Check every assertion in this paragraph that relates to the source provided. Specifically:
 
-1. **Quotations**: Any text in quotation marks must be EXACT—verbatim from the source. Ellipses ("...") may replace omitted text, and brackets ("[ ]") may indicate alterations—both are acceptable if the surrounding text is otherwise exact. Flag any quotation that adds, removes, or changes words beyond these conventions.
+1. **Quotations**: Any text in quotation marks attributed to this source must be EXACT—verbatim. Ellipses (\u2026 or "...") may replace omitted text, and brackets ("[ ]") may indicate alterations—both are acceptable if the surrounding text is otherwise exact. Flag any quotation that adds, removes, or changes words beyond these conventions.
 
 2. **Case assertions**: When the brief says a case "held" something, or describes what a court "found" or "concluded," verify that the case actually says that. Check the holding, the reasoning, and any pin cites.
 
@@ -299,6 +311,8 @@ Check every assertion in this paragraph against the source material provided. Sp
 4. **State's Brief assertions**: When the brief describes what "the State argues" or quotes the State's Brief, verify accuracy against the State's Brief text.
 
 5. **Pin cites**: Verify that pin-cite page numbers correspond to the actual location of the quoted or cited material in the source.
+
+Only check assertions that relate to THIS source. Skip assertions about other sources.
 
 ## Output format
 
@@ -309,7 +323,7 @@ For each assertion you check, output one entry. Output a JSON array:
   {{
     "assertion": "<the specific claim being checked>",
     "source": "<which source: case name, RR vol:page, State's Br., etc.>",
-    "status": "VERIFIED|INACCURATE|QUOTE_ERROR|PIN_CITE_ERROR|UNSUPPORTED|NOT_CHECKED",
+    "status": "VERIFIED|INACCURATE|QUOTE_ERROR|PIN_CITE_ERROR|UNSUPPORTED",
     "detail": "<explanation—if verified, say so briefly; if error, explain precisely what's wrong>"
   }}
 ]
@@ -321,7 +335,6 @@ Status meanings:
 - QUOTE_ERROR: A quotation is not verbatim (beyond ellipses/brackets).
 - PIN_CITE_ERROR: The pin cite page doesn't contain the referenced material.
 - UNSUPPORTED: The source doesn't address the proposition at all.
-- NOT_CHECKED: Source material was not provided, so you cannot verify.
 
 Output ONLY the JSON array. No commentary, no markdown fencing. Begin with [ and end with ].
 
@@ -329,9 +342,9 @@ Output ONLY the JSON array. No commentary, no markdown fencing. Begin with [ and
 
 {paragraph}
 
-## Source materials:
+## Source:
 
-{sources}
+{source}
 """
 
 
@@ -342,15 +355,8 @@ def claude_env():
     return env
 
 
-def verify_paragraph(para_num: int, paragraph: str, sources_text: str,
-                     model: str = "opus", max_retries: int = 3) -> list[dict]:
-    """Send a paragraph + sources to Claude for verification."""
-    prompt = VERIFY_PROMPT.format(
-        para_num=para_num,
-        paragraph=paragraph,
-        sources=sources_text if sources_text.strip() else "(No source materials available for the citations in this paragraph.)",
-    )
-
+def _call_claude(prompt: str, model: str, label: str, max_retries: int = 3) -> list[dict]:
+    """Send a prompt to Claude and parse the JSON array response."""
     for attempt in range(max_retries):
         try:
             cmd = ["claude", "--print", "--model", model]
@@ -361,26 +367,66 @@ def verify_paragraph(para_num: int, paragraph: str, sources_text: str,
 
             if result.returncode != 0:
                 err = result.stderr.strip() or result.stdout.strip()
-                print(f"    Para {para_num}: Claude error (attempt {attempt+1}): {err[:200]}", file=sys.stderr)
+                print(f"    {label}: Claude error (attempt {attempt+1}): {err[:200]}", file=sys.stderr)
                 if attempt < max_retries - 1:
                     time.sleep(15 * (attempt + 1))
                 continue
 
             text = result.stdout.strip()
             if not text:
-                print(f"    Para {para_num}: empty response (attempt {attempt+1})", file=sys.stderr)
+                print(f"    {label}: empty response (attempt {attempt+1})", file=sys.stderr)
                 if attempt < max_retries - 1:
                     time.sleep(15 * (attempt + 1))
                 continue
 
-            return parse_json_array(text, f"Para {para_num}")
+            return parse_json_array(text, label)
 
         except subprocess.TimeoutExpired:
-            print(f"    Para {para_num}: timeout (attempt {attempt+1})", file=sys.stderr)
+            print(f"    {label}: timeout (attempt {attempt+1})", file=sys.stderr)
             if attempt < max_retries - 1:
                 time.sleep(15 * (attempt + 1))
 
     return []
+
+
+def verify_paragraph(para_num: int, paragraph: str, sources: list[tuple[str, str]],
+                     model: str = "opus", workers: int = 4) -> list[dict]:
+    """Verify a paragraph against each source in parallel (one prompt per source).
+
+    sources: list of (label, source_text) — e.g. ("Bell v. Wolfish, 441 U.S. 520", full_text)
+    Returns merged list of assertion dicts from all sources.
+    """
+    if not sources:
+        return []
+
+    all_assertions = []
+
+    # Build prompts
+    tasks = []
+    for label, source_text in sources:
+        prompt = VERIFY_PROMPT.format(
+            para_num=para_num,
+            paragraph=paragraph,
+            source=f"=== {label} ===\n{source_text}",
+        )
+        tasks.append((prompt, label))
+
+    # Run in parallel
+    with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as executor:
+        futures = {}
+        for prompt, label in tasks:
+            future = executor.submit(_call_claude, prompt, model, f"Para {para_num}/{label}")
+            futures[future] = label
+
+        for future in as_completed(futures):
+            label = futures[future]
+            try:
+                results = future.result()
+                all_assertions.extend(results)
+            except Exception as e:
+                print(f"    Para {para_num}/{label}: FAILED — {e}", file=sys.stderr)
+
+    return all_assertions
 
 
 def parse_json_array(text: str, label: str = "") -> list[dict]:
@@ -417,38 +463,48 @@ def parse_json_array(text: str, label: str = "") -> list[dict]:
 # Source gathering
 # ---------------------------------------------------------------------------
 
-MAX_SOURCE_CHARS = 180000  # Cap total source material to stay within context limits
-
 
 def gather_sources(paragraph: str, auth_files: dict[str, str],
                    record_index: dict | None, state_brief_text: str | None,
-                   last_case: dict | None) -> tuple[str, dict | None]:
+                   last_case: dict | None) -> tuple[list[tuple[str, str]], dict | None]:
     """Gather all source materials referenced in this paragraph.
 
-    Returns (sources_text, last_case_cited).
+    Returns (sources, last_case_cited) where sources is a list of
+    (label, full_text) tuples — one per source, each sent as a
+    separate verification prompt.
     """
-    parts = []
-    total_chars = 0
+    sources = []
     current_last_case = last_case
+    clean_para = _clean_for_cite_match(paragraph)
 
-    def add_source(header: str, text: str) -> bool:
-        """Add a source if within the size cap. Returns True if added."""
-        nonlocal total_chars
-        if total_chars + len(text) > MAX_SOURCE_CHARS:
-            # Truncate this source to fit
-            remaining = MAX_SOURCE_CHARS - total_chars
-            if remaining > 1000:
-                parts.append(f"{header}\n{text[:remaining]}\n\n[... TRUNCATED for length ...]\n")
-                total_chars += remaining
-                return True
+    # --- State's Brief ---
+    sb_refs = extract_state_brief_refs(paragraph)
+    needs_state_brief = bool(sb_refs) or bool(STATE_ARGUES_RE.search(clean_para))
+    if needs_state_brief and state_brief_text:
+        sources.append(("State's Brief", state_brief_text))
+
+    # --- Record references (group all record pages into one source) ---
+    record_refs = extract_record_refs(paragraph)
+    record_parts = []
+    for ref in record_refs:
+        if ref["type"] == "rr":
+            page_text = get_record_page(record_index, "RR", ref["volume"], ref["page"])
+            if page_text:
+                record_parts.append(f"--- RR{ref['volume']}:{ref['page']} ---\n{page_text}")
             else:
-                parts.append(f"{header} [OMITTED — source limit reached]\n")
-                return False
-        parts.append(f"{header}\n{text}\n")
-        total_chars += len(text)
-        return True
+                record_parts.append(f"--- RR{ref['volume']}:{ref['page']} --- [PAGE NOT FOUND IN INDEX]")
+        elif ref["type"] == "cr":
+            page_text = get_record_page(record_index, "CR", 0, ref["page"])
+            if page_text:
+                record_parts.append(f"--- CR:{ref['page']} ---\n{page_text}")
+            else:
+                record_parts.append(f"--- CR:{ref['page']} --- [PAGE NOT FOUND IN INDEX]")
+        elif ref["type"] == "exhibit":
+            record_parts.append(f"--- SX{ref['number']} {ref['timestamp']} --- [EXHIBIT VERIFICATION NOT AVAILABLE]")
+    if record_parts:
+        sources.append(("Record", "\n\n".join(record_parts)))
 
-    # Case citations
+    # --- Case citations (one source per case) ---
     case_cites = extract_case_cites(paragraph)
     for cite in case_cites:
         match = find_authority(
@@ -457,48 +513,19 @@ def gather_sources(paragraph: str, auth_files: dict[str, str],
         )
         if match:
             fname, text = match
-            add_source(f"=== CASE: {fname} ===", text)
+            sources.append((fname, text))
             current_last_case = {"name": fname, "text": text}
-        else:
-            cite_str = f"{cite['case_name']}, {cite['volume']} {cite['reporter']} {cite['page']}"
-            parts.append(f"=== CASE: {cite_str} === [AUTHORITY TEXT NOT AVAILABLE]\n")
 
     # Handle Id. citations — refer to the last-cited case
-    clean_para = _clean_for_cite_match(paragraph)
     if ID_CITE_RE.search(clean_para) and not case_cites:
         if last_case:
-            add_source(f"=== CASE (Id. reference): {last_case['name']} ===", last_case["text"])
+            sources.append((f"{last_case['name']} (Id.)", last_case["text"]))
 
     # Update last_case if we had new case cites
     if case_cites and current_last_case:
         last_case = current_last_case
 
-    # Record references
-    record_refs = extract_record_refs(paragraph)
-    for ref in record_refs:
-        if ref["type"] == "rr":
-            page_text = get_record_page(record_index, "RR", ref["volume"], ref["page"])
-            if page_text:
-                add_source(f"=== RECORD: RR{ref['volume']}:{ref['page']} ===", page_text)
-            else:
-                parts.append(f"=== RECORD: RR{ref['volume']}:{ref['page']} === [PAGE NOT FOUND IN INDEX]\n")
-        elif ref["type"] == "cr":
-            page_text = get_record_page(record_index, "CR", 0, ref["page"])
-            if page_text:
-                add_source(f"=== RECORD: CR:{ref['page']} ===", page_text)
-            else:
-                parts.append(f"=== RECORD: CR:{ref['page']} === [PAGE NOT FOUND IN INDEX]\n")
-        elif ref["type"] == "exhibit":
-            parts.append(f"=== EXHIBIT: SX{ref['number']} {ref['timestamp']} === [EXHIBIT VERIFICATION NOT AVAILABLE]\n")
-
-    # State's Brief references
-    sb_refs = extract_state_brief_refs(paragraph)
-    if sb_refs and state_brief_text:
-        add_source("=== STATE'S BRIEF (full text) ===", state_brief_text)
-    elif sb_refs:
-        parts.append("=== STATE'S BRIEF === [TEXT NOT AVAILABLE]\n")
-
-    return "\n".join(parts), current_last_case
+    return sources, current_last_case
 
 
 # ---------------------------------------------------------------------------
@@ -640,8 +667,8 @@ def main():
     parser.add_argument("docx", type=Path, help="Path to the .docx brief")
     parser.add_argument("--output", "-o", type=Path, default=None,
                         help="Output markdown file (default: CITECHECK_LINEBY.md in same dir)")
-    parser.add_argument("--model", default="sonnet",
-                        help="Claude model to use (default: sonnet)")
+    parser.add_argument("--model", default="opus",
+                        help="Claude model to use (default: opus)")
     parser.add_argument("--start", type=int, default=0,
                         help="Start from this paragraph index (for resuming)")
     parser.add_argument("--limit", type=int, default=0,
@@ -776,16 +803,16 @@ def main():
         print(f"\n[{seq+1}/{len(cite_paragraphs)}] Para {para_idx} ({elapsed:.0f}s elapsed)")
         print(f"  {text[:100]}...")
 
-        # Gather sources
-        sources_text, last_case = gather_sources(text, auth_files, record_index,
-                                                  state_brief_text, last_case)
+        # Gather sources (list of (label, text) tuples — one per source)
+        sources, last_case = gather_sources(text, auth_files, record_index,
+                                            state_brief_text, last_case)
 
-        n_sources = sources_text.count("===")
-        source_kb = len(sources_text) / 1024
-        print(f"  Sources: {n_sources // 2} items, {source_kb:.0f} KB")
+        total_kb = sum(len(t) for _, t in sources) / 1024
+        source_labels = [label[:40] for label, _ in sources]
+        print(f"  Sources ({len(sources)}): {', '.join(source_labels)} [{total_kb:.0f} KB total]")
 
-        # Call Claude
-        assertions = verify_paragraph(para_idx, text, sources_text, model=args.model)
+        # Call Claude — one prompt per source, in parallel
+        assertions = verify_paragraph(para_idx, text, sources, model=args.model)
         n_verified = sum(1 for a in assertions if a.get("status") == "VERIFIED")
         n_errors = sum(1 for a in assertions if a.get("status") in
                        ("INACCURATE", "QUOTE_ERROR", "PIN_CITE_ERROR", "UNSUPPORTED"))
