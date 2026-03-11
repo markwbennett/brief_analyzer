@@ -39,6 +39,8 @@ SESSION_NOTES.md
 PROGRESS.md
 filings_manifest.json
 case_info.json
+*_check.json
+*_result.json
 
 # Secrets
 .env
