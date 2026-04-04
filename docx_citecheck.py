@@ -40,9 +40,12 @@ import fitz  # PyMuPDF
 
 # Reporter abbreviations (shared across patterns) — capturing group
 _REPORTERS = (
-    r'(S\.W\.(?:2d|3d)|U\.S\.|F\.(?:2d|3d|4th)|F\.\s*Supp\.(?:\s*2d)?|'
-    r'Fed\.?\s*App(?:x|\'x)\.?|N\.E\.(?:2d)?|A\.(?:2d)?|P\.(?:2d|3d)?|'
-    r'N\.M\.|Wash\.App\.|Ill\.App\.3d|Pa\.Super\.|Tex\.|Md\.|F\.4th)'
+    r'(S\.W\.(?:2d|3d|4th)|U\.S\.|S\.\s*Ct\.|L\.\s*Ed\.(?:\s*2d)?|'
+    r'F\.(?:2d|3d|4th)|F\.\s*Supp\.(?:\s*(?:2d|3d))?|'
+    r'Fed\.?\s*App(?:x|\'x)\.?|N\.E\.(?:2d)?|A\.(?:2d|3d)?|P\.(?:2d|3d)?|'
+    r'So\.(?:2d|3d)?|Cal\.Rptr\.(?:\s*(?:2d|3d))?|'
+    r'N\.M\.|Wash\.App\.|Ill\.App\.3d|Pa\.Super\.|Tex\.|Md\.|'
+    r'Tex\.\s*Crim\.\s*App\.|WL)'
 )
 
 # Full case citations: Name v. Name, VOL Reporter PAGE
@@ -126,6 +129,9 @@ def has_citation(text: str) -> bool:
 # Authority file matching
 # ---------------------------------------------------------------------------
 
+GLOBAL_AUTHORITIES_DIR = Path.home() / "Discovery" / "Appeals" / "authorities_global"
+
+
 def segment_by_pages(text: str) -> str:
     """Replace inline *NNN page markers with clear [PAGE NNN] headers.
 
@@ -136,41 +142,251 @@ def segment_by_pages(text: str) -> str:
     return re.sub(r'\*(\d{2,})(?=\s|$)', r'\n\n[PAGE \1]\n', text)
 
 
-def load_authorities(auth_dir: Path) -> dict[str, str]:
-    """Load all .txt authority files into {filename: text}."""
-    files = {}
-    for f in sorted(auth_dir.glob("*.txt")):
-        if f.name.startswith("-"):
-            continue  # skip symlink aliases
+def _extract_reporter_cite(text: str) -> str | None:
+    """Extract a reporter citation from text.
+
+    Returns a normalized lowercase string like '666 s.w.3d 735' or None.
+    Matches any reporter abbreviation (contains a period or is 'WL').
+    """
+    for m in re.finditer(r'(\d+)\s+([A-Za-z].+?)\s+(\d+)(?!\w)', text):
+        reporter = m.group(2)
+        if (len(reporter) <= 25
+                and ('.' in reporter or reporter.upper() == 'WL')
+                and 'LEXIS' not in reporter.upper()):
+            return f"{m.group(1)} {reporter.lower()} {m.group(3)}"
+    return None
+
+
+def _norm_cite(s: str) -> str:
+    """Normalize a citation for matching: lowercase, collapse spaces after dots."""
+    s = re.sub(r'\s+', ' ', s.lower().strip())
+    s = re.sub(r'\.\s+', '.', s)
+    return s
+
+
+def _strip_filename_decorations(name: str) -> str:
+    """Strip emoji flags, number prefixes, and macOS dup suffixes from a filename stem."""
+    # Strip leading number prefixes like "01 - ", "s501 - "
+    clean = re.sub(r'^[a-zA-Z]*\d+\s*-\s*', '', name).strip()
+    # Strip macOS duplicate suffix like "(2)"
+    clean = re.sub(r'\s*\(\d+\)\s*$', '', clean)
+    # Strip trailing KeyCite flag emoji (🟥 🟨 🟢 🔴 and tag sequences)
+    clean = re.sub(r'[\U0001f7e0-\U0001f7ff\U0001f3f4\U000e0000-\U000e007f\U0001f534]+$', '', clean).rstrip()
+    return clean
+
+
+def _read_authority_text(path: Path) -> str | None:
+    """Read text from a .txt, .rtf, or .pdf authority file."""
+    if path.suffix.lower() == '.txt':
         try:
-            files[f.name] = f.read_text(errors="replace")
-        except Exception as e:
-            print(f"  Warning: could not read {f.name}: {e}", file=sys.stderr)
-    return files
+            return path.read_text(errors="replace")
+        except Exception:
+            return None
+    if path.suffix.lower() == '.rtf':
+        # Try converting via textutil (macOS)
+        txt_sibling = path.with_suffix('.txt')
+        if txt_sibling.exists():
+            try:
+                return txt_sibling.read_text(errors="replace")
+            except Exception:
+                return None
+        try:
+            result = subprocess.run(
+                ["textutil", "-convert", "txt", str(path), "-output", str(txt_sibling)],
+                capture_output=True, check=True, timeout=30,
+            )
+            return txt_sibling.read_text(errors="replace")
+        except Exception:
+            return None
+    if path.suffix.lower() == '.pdf':
+        # Prefer a .txt sibling
+        txt_sibling = path.with_suffix('.txt')
+        if txt_sibling.exists():
+            try:
+                return txt_sibling.read_text(errors="replace")
+            except Exception:
+                pass
+        # Fallback: extract via pdftotext
+        try:
+            result = subprocess.run(
+                ["pdftotext", str(path), "-"],
+                capture_output=True, text=True, check=True, timeout=30,
+            )
+            return result.stdout
+        except Exception:
+            return None
+    return None
+
+
+class LazyAuthorities(dict):
+    """Dict-like mapping of {display_name: text} with lazy text loading.
+
+    Keys (cleaned filename stems) are available immediately for iteration
+    and index-building. Text values are loaded on first access from disk.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._paths: dict[str, Path] = {}  # clean_stem -> best file path
+        self._cache: dict[str, str] = {}   # clean_stem -> loaded text
+
+    def register(self, clean_stem: str, path: Path):
+        """Register a file path for a cleaned stem (no text loading)."""
+        self._paths[clean_stem] = path
+        # Insert a sentinel so len(), __contains__, keys(), iteration work
+        super().__setitem__(clean_stem, None)
+
+    def __getitem__(self, key: str) -> str:
+        if key in self._cache:
+            return self._cache[key]
+        if key in self._paths:
+            text = _read_authority_text(self._paths[key])
+            if text:
+                self._cache[key] = text
+                return text
+            # File couldn't be read — return empty string
+            self._cache[key] = ""
+            return ""
+        raise KeyError(key)
+
+    def __contains__(self, key) -> bool:
+        return key in self._paths
+
+    def __iter__(self):
+        return iter(self._paths)
+
+    def __len__(self):
+        return len(self._paths)
+
+    def keys(self):
+        return self._paths.keys()
+
+    def items(self):
+        for key in self._paths:
+            yield key, self[key]
+
+    def values(self):
+        for key in self._paths:
+            yield self[key]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def load_authorities(auth_dir: Path) -> LazyAuthorities:
+    """Index authority files into {display_name: text} with lazy loading.
+
+    Searches local auth_dir and global authorities directory.
+    Handles .txt, .rtf, and .pdf files. Searches recursively.
+    Prefers .txt > .rtf > .pdf. Local files take precedence over global.
+    Text is loaded lazily on first access — indexing is fast.
+    """
+    EXT_PRIORITY = {'.txt': 0, '.rtf': 1, '.pdf': 2}
+    best_files: dict[str, tuple[Path, int]] = {}
+
+    search_dirs = []
+    if auth_dir.exists():
+        search_dirs.append(auth_dir)
+    if GLOBAL_AUTHORITIES_DIR.exists() and (
+            not auth_dir.exists()
+            or GLOBAL_AUTHORITIES_DIR.resolve() != auth_dir.resolve()):
+        search_dirs.append(GLOBAL_AUTHORITIES_DIR)
+
+    for dir_idx, search_dir in enumerate(search_dirs):
+        for ext in ("*.txt", "*.rtf", "*.pdf"):
+            for path in sorted(search_dir.rglob(ext)):
+                if path.name.startswith("-") or path.name.startswith("."):
+                    continue
+                stem = path.stem
+                clean = _strip_filename_decorations(stem)
+                if not clean:
+                    continue
+                priority = EXT_PRIORITY.get(path.suffix.lower(), 9)
+                # Add directory penalty: local=0, global=100
+                priority += dir_idx * 100
+                key = clean
+                if key not in best_files or priority < best_files[key][1]:
+                    best_files[key] = (path, priority)
+
+    # Build lazy dict — register all paths without loading text
+    auth_files = LazyAuthorities()
+    for clean_stem, (path, _) in best_files.items():
+        auth_files.register(clean_stem, path)
+
+    return auth_files
+
+
+def build_cite_index(auth_files: LazyAuthorities | dict) -> dict[str, str]:
+    """Build an index mapping normalized reporter cites to authority keys.
+
+    Returns {normalized_cite: auth_key} for fast citation lookup.
+    Only inspects filenames (keys), not file content — so this is fast.
+    """
+    index = {}
+    for clean_stem in auth_files:
+        cite = _extract_reporter_cite(clean_stem)
+        if cite:
+            norm = _norm_cite(cite)
+            if norm not in index:  # first match wins (local precedence preserved)
+                index[norm] = clean_stem
+    return index
 
 
 def find_authority(case_name: str, volume: str, reporter: str, page: str,
-                   auth_files: dict[str, str]) -> tuple[str, str] | None:
-    """Find authority file by citation components."""
-    cite_pattern = f"{volume} {reporter} {page}" if reporter != "WL" else f"WL {page}"
+                   auth_files: dict[str, str],
+                   cite_index: dict[str, str] | None = None) -> tuple[str, str] | None:
+    """Find authority file by citation components.
 
-    # Match in filename
+    Uses a multi-pass strategy:
+    1. Normalized reporter-cite index lookup (fast, handles spacing/case variations)
+    2. Space-stripped substring match in filenames
+    3. Loose volume+page+reporter match
+    4. Case name + volume/page match
+    5. Content header match
+    6. Case name alone (last resort)
+    """
+    # Build the search cite from components
+    if reporter == "WL":
+        search_cite = f"{volume} wl {page}" if volume else f"wl {page}"
+        cite_pattern = f"WL {page}"
+    else:
+        search_cite = f"{volume} {reporter} {page}"
+        cite_pattern = search_cite
+
+    # Pass 1: Normalized citation index lookup
+    if cite_index:
+        norm_search = _norm_cite(search_cite)
+        if norm_search in cite_index:
+            key = cite_index[norm_search]
+            return (key, auth_files[key])
+
+        # Try with WL format variations
+        if reporter == "WL" and volume:
+            alt_search = f"{volume} wl {page}"
+            norm_alt = _norm_cite(alt_search)
+            if norm_alt in cite_index:
+                key = cite_index[norm_alt]
+                return (key, auth_files[key])
+
+    # Pass 2: Space-stripped substring match in filenames
+    cite_no_spaces = cite_pattern.replace(" ", "").lower()
     for fname, text in auth_files.items():
-        if cite_pattern.replace(" ", "") in fname.replace(" ", ""):
-            return (fname, text)
-        if cite_pattern in fname:
+        if cite_no_spaces in fname.replace(" ", "").lower():
             return (fname, text)
 
-    # Looser filename match
-    for fname, text in auth_files.items():
-        if volume and page and volume in fname and page in fname:
-            # Check reporter abbreviation loosely
-            rep_short = reporter.replace(".", "").replace(" ", "").lower()
-            fname_clean = fname.replace(".", "").replace(" ", "").lower()
-            if rep_short in fname_clean:
-                return (fname, text)
+    # Pass 3: Loose filename match — volume + page + reporter abbreviation
+    if volume and page:
+        rep_short = reporter.replace(".", "").replace(" ", "").lower()
+        for fname, text in auth_files.items():
+            if volume in fname and page in fname:
+                fname_clean = fname.replace(".", "").replace(" ", "").lower()
+                if rep_short in fname_clean:
+                    return (fname, text)
 
-    # Match by case name + either volume or page
+    # Pass 4: Case name + volume or page
     if case_name:
         first_party = case_name.split(" v.")[0].split(" v ")[0].strip()
         last_word = first_party.split()[-1].lower() if first_party else ""
@@ -179,14 +395,18 @@ def find_authority(case_name: str, volume: str, reporter: str, page: str,
                 if last_word in fname.lower() and (volume in fname or page in fname):
                     return (fname, text)
 
-    # Match in file content header
+    # Pass 5: Match in file content header
     for fname, text in auth_files.items():
         header = text[:3000]
         if volume and reporter and page:
             if f"{volume} {reporter} {page}" in header:
                 return (fname, text)
+            # Also try normalized match in header
+            norm_header = _norm_cite(header)
+            if _norm_cite(cite_pattern) in norm_header:
+                return (fname, text)
 
-    # Last resort: match by case name alone (for parallel citations)
+    # Pass 6: Last resort — case name alone (for parallel citations)
     if case_name:
         first_party = case_name.split(" v.")[0].split(" v ")[0].strip()
         last_word = first_party.split()[-1].lower() if first_party else ""
@@ -450,7 +670,8 @@ def verify_paragraph(para_num: int, paragraph: str, sources: list[tuple[str, str
 
 def resolve_needs_source(para_num: int, paragraph: str, assertions: list[dict],
                          auth_files: dict[str, str], model: str = "opus",
-                         workers: int = 4, page_num: int | None = None) -> list[dict]:
+                         workers: int = 4, page_num: int | None = None,
+                         cite_index: dict[str, str] | None = None) -> list[dict]:
     """Second pass: resolve NEEDS_SOURCE assertions by finding the named authorities.
 
     Parses case names/citations from the NEEDS_SOURCE detail field, looks them
@@ -469,14 +690,16 @@ def resolve_needs_source(para_num: int, paragraph: str, assertions: list[dict],
         # Extract WL citations from the detail text
         for m in WL_CITE_RE.finditer(detail):
             wl = m.group(0)
-            match = find_authority("", "", "WL", wl.split("WL")[1].strip(), auth_files)
+            match = find_authority("", "", "WL", wl.split("WL")[1].strip(),
+                                   auth_files, cite_index=cite_index)
             if match and match[0] not in seen_fnames:
                 seen_fnames.add(match[0])
                 extra_sources.append(match)
         # Extract full case citations from the detail text
         for m in CASE_CITE_RE.finditer(detail):
             name, vol, rep, pg = m.group(1).strip(), m.group(2), m.group(3), m.group(4)
-            match = find_authority(name, vol, rep, pg, auth_files)
+            match = find_authority(name, vol, rep, pg, auth_files,
+                                   cite_index=cite_index)
             if match and match[0] not in seen_fnames:
                 seen_fnames.add(match[0])
                 extra_sources.append(match)
@@ -537,7 +760,8 @@ def parse_json_array(text: str, label: str = "") -> list[dict]:
 
 def gather_sources(paragraph: str, auth_files: dict[str, str],
                    record_index: dict | None, state_brief_text: str | None,
-                   last_case: dict | None) -> tuple[list[tuple[str, str]], dict | None]:
+                   last_case: dict | None,
+                   cite_index: dict[str, str] | None = None) -> tuple[list[tuple[str, str]], dict | None]:
     """Gather all source materials referenced in this paragraph.
 
     Returns (sources, last_case_cited) where sources is a list of
@@ -580,7 +804,7 @@ def gather_sources(paragraph: str, auth_files: dict[str, str],
     for cite in case_cites:
         match = find_authority(
             cite["case_name"], cite["volume"], cite["reporter"], cite["page"],
-            auth_files,
+            auth_files, cite_index=cite_index,
         )
         if match:
             fname, text = match
@@ -808,8 +1032,16 @@ def main():
         auth_files = load_authorities(auth_dir)
         print(f"Loaded {len(auth_files)} authority files")
     else:
-        auth_files = {}
-        print("No authorities/ directory found")
+        # No local authorities/ directory; load_authorities still checks global
+        auth_files = load_authorities(auth_dir)
+        if auth_files:
+            print(f"Loaded {len(auth_files)} authority files (global only)")
+        else:
+            print("No authorities/ directory found")
+
+    # Build citation index for fast lookups
+    cite_index = build_cite_index(auth_files)
+    print(f"Citation index: {len(cite_index)} entries")
 
     # Load record index
     record_dir = project_dir / "record"
@@ -929,7 +1161,8 @@ def main():
 
         # Gather sources (list of (label, text) tuples — one per source)
         sources, last_case = gather_sources(text, auth_files, record_index,
-                                            state_brief_text, last_case)
+                                            state_brief_text, last_case,
+                                            cite_index=cite_index)
 
         total_kb = sum(len(t) for _, t in sources) / 1024
         source_labels = [label[:40] for label, _ in sources]
@@ -941,7 +1174,8 @@ def main():
 
         # Second pass: resolve any NEEDS_SOURCE assertions
         assertions = resolve_needs_source(para_idx, text, assertions, auth_files,
-                                          model=args.model, page_num=page_num)
+                                          model=args.model, page_num=page_num,
+                                          cite_index=cite_index)
 
         n_verified = sum(1 for a in assertions if a.get("status") == "VERIFIED")
         n_errors = sum(1 for a in assertions if a.get("status") in
