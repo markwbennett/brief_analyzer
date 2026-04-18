@@ -42,7 +42,8 @@ import fitz  # PyMuPDF
 _REPORTERS = (
     r'(S\.W\.(?:2d|3d|4th)|U\.S\.|S\.\s*Ct\.|L\.\s*Ed\.(?:\s*2d)?|'
     r'F\.(?:2d|3d|4th)|F\.\s*Supp\.(?:\s*(?:2d|3d))?|'
-    r'Fed\.?\s*App(?:x|\'x)\.?|N\.E\.(?:2d)?|A\.(?:2d|3d)?|P\.(?:2d|3d)?|'
+    r'Fed\.?\s*App(?:x|\'x)\.?|N\.E\.(?:2d|3d)?|N\.W\.(?:2d)?|'
+    r'A\.(?:2d|3d)?|P\.(?:2d|3d)?|'
     r'So\.(?:2d|3d)?|Cal\.Rptr\.(?:\s*(?:2d|3d))?|'
     r'N\.M\.|Wash\.App\.|Ill\.App\.3d|Pa\.Super\.|Tex\.|Md\.|'
     r'Tex\.\s*Crim\.\s*App\.|WL)'
@@ -126,10 +127,85 @@ def has_citation(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Id. resolution — preprocessing pass
+# ---------------------------------------------------------------------------
+
+def build_id_map(paragraphs: list[tuple[int, str]]) -> dict[int, dict]:
+    """Build a map from paragraph index to the citation that 'Id.' refers to.
+
+    Processes all paragraphs in brief order. For each Id. occurrence,
+    finds the last case citation that appeared *before* the Id. in the
+    text — whether in the same paragraph or a prior one.
+
+    Returns {para_index: cite_dict} for paragraphs containing Id.
+    where the reference can be resolved. cite_dict has keys:
+    case_name, volume, reporter, page.
+    """
+    id_map = {}
+    last_cite = None  # dict with case_name, volume, reporter, page
+
+    for idx, text in paragraphs:
+        clean = _clean_for_cite_match(text)
+
+        # Collect all cite positions in this paragraph
+        # Each entry: (position, {case_name, volume, reporter, page})
+        cite_positions = []
+        for m in CASE_CITE_RE.finditer(clean):
+            cite_positions.append((m.start(), {
+                "case_name": m.group(1).strip(),
+                "volume": m.group(2),
+                "reporter": m.group(3),
+                "page": m.group(4),
+            }))
+        for m in SHORT_CITE_RE.finditer(clean):
+            cite_positions.append((m.start(), {
+                "case_name": m.group(1).strip(),
+                "volume": m.group(2),
+                "reporter": m.group(3),
+                "page": m.group(4),
+            }))
+        # Bare reporter cites (e.g., "585 U.S. 296") — no case name
+        for m in BARE_REPORTER_RE.finditer(clean):
+            # Skip if this position is already covered by a full or short cite
+            pos = m.start()
+            if any(abs(pos - cp[0]) < 5 for cp in cite_positions):
+                continue
+            cite_positions.append((pos, {
+                "case_name": "",
+                "volume": m.group(1),
+                "reporter": m.group(2),
+                "page": m.group(3),
+            }))
+        cite_positions.sort(key=lambda x: x[0])
+
+        id_matches = list(ID_CITE_RE.finditer(clean))
+
+        if id_matches:
+            # For the first Id. in this paragraph, find the last cite
+            # that precedes it (could be in this paragraph or a prior one)
+            first_id_pos = id_matches[0].start()
+
+            # Check for cites before the Id. in this paragraph
+            cites_before_id = [c for c in cite_positions if c[0] < first_id_pos]
+            if cites_before_id:
+                last_cite = cites_before_id[-1][1]
+
+            if last_cite:
+                id_map[idx] = last_cite
+
+        # Update last_cite to the last cite in this paragraph
+        # (for use by subsequent paragraphs)
+        if cite_positions:
+            last_cite = cite_positions[-1][1]
+
+    return id_map
+
+
+# ---------------------------------------------------------------------------
 # Authority file matching
 # ---------------------------------------------------------------------------
 
-GLOBAL_AUTHORITIES_DIR = Path.home() / "Discovery" / "Appeals" / "authorities_global"
+GLOBAL_AUTHORITIES_DIR = Path.home() / "Appeals" / "authorities_global"
 
 
 def segment_by_pages(text: str) -> str:
@@ -529,9 +605,21 @@ def get_record_page(record_index: dict, vol_type: str, vol_num: int, page: int) 
 
 VERIFY_PROMPT = """You are a meticulous legal cite-checker. You are checking a single paragraph from an appellate reply brief against ONE source.
 
-## Your task
+## Citation-scope rule
 
-Check every assertion in this paragraph that relates to the source provided. Specifically:
+A citation supports ONLY the sentence immediately before it. In the sequence "Sentence A. Sentence B. Case, 123 S.W.3d at 456. Sentence C. Sentence D." — the citation supports Sentence B only. Sentences A, C, and D are the author's own argument and must NOT be checked against this source.
+
+**Exception — quotations:** Any text in quotation marks (inline or block) that is attributed to this source must be verified regardless of where it appears in the paragraph.
+
+To apply this rule:
+1. Find each citation to THIS source in the paragraph (full cite, short cite, or Id./id.).
+2. Identify the sentence immediately before that citation — that is the supported sentence.
+3. Check ONLY those supported sentences and any quotations attributed to this source.
+4. Do NOT check other sentences in the paragraph. They are argument, not source-supported propositions.
+
+## What to check
+
+For each supported sentence or quotation:
 
 1. **Quotations**: Any text in quotation marks attributed to this source must be EXACT—verbatim. Ellipses (\u2026 or "...") may replace omitted text, and brackets ("[ ]") may indicate alterations—both are acceptable if the surrounding text is otherwise exact. Flag any quotation that adds, removes, or changes words beyond these conventions.
 
@@ -543,7 +631,7 @@ Check every assertion in this paragraph that relates to the source provided. Spe
 
 5. **Pin cites**: Verify that pin-cite page numbers correspond to the actual location of the quoted or cited material in the source. The source text contains [PAGE NNN] headers marking where each reporter page begins. Use these headers to determine which page a passage falls on. A passage is on page NNN if it appears after [PAGE NNN] and before the next [PAGE] header. If a pin cite says "at 982–83" but the material falls entirely after [PAGE 982] and before [PAGE 983], the correct cite is just 982, not 982–83.
 
-Only check assertions that relate to THIS source. Skip assertions about other sources.
+Only check supported sentences and quotations as defined by the citation-scope rule above. Skip all other sentences — they are the author's argument, not source-supported claims.
 
 ## Output format
 
@@ -761,12 +849,17 @@ def parse_json_array(text: str, label: str = "") -> list[dict]:
 def gather_sources(paragraph: str, auth_files: dict[str, str],
                    record_index: dict | None, state_brief_text: str | None,
                    last_case: dict | None,
-                   cite_index: dict[str, str] | None = None) -> tuple[list[tuple[str, str]], dict | None]:
+                   cite_index: dict[str, str] | None = None,
+                   id_target: dict | None = None) -> tuple[list[tuple[str, str]], dict | None]:
     """Gather all source materials referenced in this paragraph.
 
     Returns (sources, last_case_cited) where sources is a list of
     (label, full_text) tuples — one per source, each sent as a
     separate verification prompt.
+
+    id_target: if provided, the case name that Id. refers to in this
+    paragraph (from build_id_map preprocessing). Overrides last_case
+    for Id. resolution.
     """
     sources = []
     current_last_case = last_case
@@ -811,10 +904,26 @@ def gather_sources(paragraph: str, auth_files: dict[str, str],
             sources.append((fname, text))
             current_last_case = {"name": fname, "text": text}
 
-    # Handle Id. citations — refer to the last-cited case
-    if ID_CITE_RE.search(clean_para) and not case_cites:
-        if last_case:
-            sources.append((f"{last_case['name']} (Id.)", last_case["text"]))
+    # Handle Id. citations — resolve to the correct authority.
+    # id_target (from build_id_map) is authoritative when available.
+    if ID_CITE_RE.search(clean_para):
+        id_resolved = False
+        if id_target:
+            # Use find_authority for precise matching with vol/reporter/page
+            match = find_authority(
+                id_target["case_name"], id_target["volume"],
+                id_target["reporter"], id_target["page"],
+                auth_files, cite_index=cite_index,
+            )
+            if match:
+                fname, ftext = match
+                # Avoid duplicates if the same source is already loaded
+                if not any(fname == s[0] for s in sources):
+                    sources.append((f"{fname} (Id.)", ftext))
+                id_resolved = True
+        if not id_resolved and last_case:
+            if not any(last_case['name'] in s[0] for s in sources):
+                sources.append((f"{last_case['name']} (Id.)", last_case["text"]))
 
     # Update last_case if we had new case cites
     if case_cites and current_last_case:
@@ -1131,6 +1240,47 @@ def main():
             print(f"   Citations: {'; '.join(cite_summary)}")
         return
 
+    # Pre-check: verify all cited authorities exist in the authorities folder
+    all_cited = {}  # {(vol, reporter, page): case_name}
+    for _, text in body_paragraphs:
+        for cite in extract_case_cites(text):
+            key = (cite["volume"], cite["reporter"], cite["page"])
+            if key not in all_cited:
+                all_cited[key] = cite["case_name"]
+        # Also check bare reporter cites
+        clean = _clean_for_cite_match(text)
+        for m in BARE_REPORTER_RE.finditer(clean):
+            key = (m.group(1), m.group(2), m.group(3))
+            if key not in all_cited:
+                all_cited[key] = ""
+
+    missing = []
+    seen_missing = set()
+    for (vol, rep, pg), name in all_cited.items():
+        match = find_authority(name, vol, rep, pg, auth_files, cite_index=cite_index)
+        if not match:
+            # Deduplicate by vol/reporter/page
+            dedup_key = (vol, rep, pg)
+            if dedup_key in seen_missing:
+                continue
+            seen_missing.add(dedup_key)
+            label = f"{name}, {vol} {rep} {pg}" if name else f"{vol} {rep} {pg}"
+            missing.append(label)
+
+    if missing:
+        print(f"\nERROR: {len(missing)} cited authorities not found in authorities/ folder:")
+        for m in sorted(missing):
+            print(f"  - {m}")
+        print("\nAdd the missing authorities and re-run. Stopping.")
+        sys.exit(1)
+
+    print(f"Authority check: all {len(all_cited)} cited authorities found")
+
+    # Preprocess: resolve Id. references across the entire brief
+    id_map = build_id_map(body_paragraphs)
+    if id_map:
+        print(f"Id. map: resolved {len(id_map)} Id. references")
+
     # Process paragraphs
     results = []
     last_case = None
@@ -1160,9 +1310,11 @@ def main():
         print(f"  {text[:100]}...")
 
         # Gather sources (list of (label, text) tuples — one per source)
+        id_target = id_map.get(para_idx)
         sources, last_case = gather_sources(text, auth_files, record_index,
                                             state_brief_text, last_case,
-                                            cite_index=cite_index)
+                                            cite_index=cite_index,
+                                            id_target=id_target)
 
         total_kb = sum(len(t) for _, t in sources) / 1024
         source_labels = [label[:40] for label, _ in sources]
